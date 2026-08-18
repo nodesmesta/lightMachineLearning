@@ -1,0 +1,211 @@
+"""Day 1 security tests (GeneralTask Day 1 list).
+
+The installer/parser must REJECT each of these 10 cases, with the
+rejection reason mapped to the proposal clause:
+
+ 1. missing manifest
+ 2. invalid JSON
+ 3. invalid app_id
+ 4. unknown capability
+ 5. missing adapter
+ 6. missing model
+ 7. incorrect SHA-256
+ 8. undeclared model artifact
+ 9. path traversal such as ../../file
+10. unsupported model format
+
+Each test runs the FULL install flow (CoreService.install_app) against
+a temporary app dir and asserts rejection + (where applicable) audit
+event. Stdlib unittest only.
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import tempfile
+import unittest
+
+from sydeco_lightml_core.core import CoreService
+
+VALID_MANIFEST = {
+    "manifest_version": 1,
+    "app_id": "sec-test-app",
+    "name": "Security Test App",
+    "version": "1.0.0",
+    "capabilities": ["inference"],
+    "models": [
+        {
+            "role": "model",
+            "file": "models/model.pkl",
+            "format": "pickle",
+            "sha256": "0" * 64,
+        }
+    ],
+    "adapter": {
+        "entry": "adapter/main.py",
+        "files": [{"file": "adapter/main.py", "sha256": "1" * 64}],
+    },
+    "release": {"key_id": "sydeco-test-key-v1", "signature": "manifest.sig"},
+    "input_schema": {
+        "type": "object",
+        "required": ["text"],
+        "properties": {"text": {"type": "string"}},
+    },
+    "output_schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {"status": {"type": "string"}},
+    },
+    "permissions": {"network": "none"},
+    "api": {"authentication": "token"},
+    "resource_limits": {
+        "max_memory": 1073741824,
+        "max_cpu": 100,
+        "inference_timeout": 120,
+        "concurrency": 1,
+    },
+    "dependencies": [],
+}
+
+
+class SecurityTests(unittest.TestCase):
+    """Ten Day-1 rejection cases."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.mkdtemp(prefix="sydeco-sec-")
+        self.data_dir = os.path.join(self._tmp, "data")
+        self.service = CoreService(data_dir=self.data_dir)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _app_dir(self) -> str:
+        d = os.path.join(self._tmp, "app")
+        os.makedirs(os.path.join(d, "models"), exist_ok=True)
+        os.makedirs(os.path.join(d, "adapter"), exist_ok=True)
+        with open(os.path.join(d, "models", "model.pkl"), "wb") as fh:
+            fh.write(b"dummy-model")
+        with open(os.path.join(d, "adapter", "main.py"), "w", encoding="utf-8") as fh:
+            fh.write("class Adapter:\n    pass\n")
+        return d
+
+    def _write_manifest(self, app_dir: str, manifest: dict) -> str:
+        path = os.path.join(app_dir, "manifest.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh)
+        return path
+
+    def _assert_rejected(self, app_dir: str, manifest: dict, expect_reason: str) -> None:
+        path = self._write_manifest(app_dir, manifest)
+        ok, message, entry = self.service.install_app(path)
+        self.assertFalse(ok, f"expected rejection, got ok with {message!r}")
+        self.assertIn(expect_reason, message.lower())
+        self.assertIsNone(entry)
+
+    # 1. missing manifest
+    def test_01_missing_manifest(self) -> None:
+        app_dir = self._app_dir()
+        path = self._write_manifest(app_dir, dict(VALID_MANIFEST))
+        os.remove(path)
+        ok, message, _ = self.service.install_app(path)
+        self.assertFalse(ok)
+        self.assertIn("manifest not found", message.lower())
+
+    # 2. invalid JSON
+    def test_02_invalid_json(self) -> None:
+        app_dir = self._app_dir()
+        path = os.path.join(app_dir, "manifest.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{ this is not json")
+        ok, message, _ = self.service.install_app(path)
+        self.assertFalse(ok)
+        self.assertIn("invalid json", message.lower())
+
+    # 3. invalid app_id (uppercase / spaces / too long)
+    def test_03_invalid_app_id(self) -> None:
+        app_dir = self._app_dir()
+        m = dict(VALID_MANIFEST)
+        m["app_id"] = "Bad_App ID"
+        self._assert_rejected(app_dir, m, "app_id")
+
+    # 4. unknown capability
+    def test_04_unknown_capability(self) -> None:
+        app_dir = self._app_dir()
+        m = dict(VALID_MANIFEST)
+        m["capabilities"] = ["inference", "teleport"]
+        self._assert_rejected(app_dir, m, "unknown capability")
+
+    # 5. missing adapter
+    def test_05_missing_adapter(self) -> None:
+        app_dir = self._app_dir()
+        m = dict(VALID_MANIFEST)
+        del m["adapter"]
+        self._assert_rejected(app_dir, m, "missing required field: adapter")
+
+    # 6. missing model
+    def test_06_missing_model(self) -> None:
+        app_dir = self._app_dir()
+        m = dict(VALID_MANIFEST)
+        m["models"] = []
+        self._assert_rejected(app_dir, m, "models")
+
+    # 7. incorrect SHA-256 (model file content does not match manifest hash)
+    def test_07_incorrect_sha256(self) -> None:
+        app_dir = self._app_dir()
+        m = dict(VALID_MANIFEST)
+        m["models"][0]["sha256"] = "f" * 64  # wrong hash
+        self._assert_rejected(app_dir, m, "sha256 mismatch")
+
+    # 8. undeclared model artifact (extra file in models/ not in manifest)
+    def test_08_undeclared_model_artifact(self) -> None:
+        app_dir = self._app_dir()
+        # valid manifest, but a second model file exists undeclared
+        with open(os.path.join(app_dir, "models", "extra.pkl"), "wb") as fh:
+            fh.write(b"undeclared")
+        m = dict(VALID_MANIFEST)
+        # hash of declared model must match (real sha of "dummy-model")
+        import hashlib
+        real_sha = hashlib.sha256(b"dummy-model").hexdigest()
+        m["models"][0]["sha256"] = real_sha
+        m["adapter"]["files"][0]["sha256"] = hashlib.sha256(
+            b"class Adapter:\n    pass\n"
+        ).hexdigest()
+        # install succeeds; orphan flag must be recorded in audit
+        path = self._write_manifest(app_dir, m)
+        ok, message, entry = self.service.install_app(path)
+        self.assertTrue(ok, f"install should succeed; got {message!r}")
+        # E4: orphan artifact flagged (audit entry), never silently ignored
+        audit_entries = []
+        audit_path = os.path.join(self.data_dir, "audit", "audit.jsonl")
+        if os.path.exists(audit_path):
+            with open(audit_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.strip():
+                        audit_entries.append(json.loads(line))
+        orphan_events = [
+            e for e in audit_entries
+            if e.get("action") == "orphan_artifact" or "orphan" in str(e.get("reason", "")).lower()
+        ]
+        self.assertTrue(
+            orphan_events,
+            "undeclared artifact must produce an orphan-flag audit event (E4)",
+        )
+
+    # 9. path traversal ../../file
+    def test_09_path_traversal(self) -> None:
+        app_dir = self._app_dir()
+        m = dict(VALID_MANIFEST)
+        m["models"][0]["file"] = "../../etc/passwd"
+        self._assert_rejected(app_dir, m, "escapes app dir")
+
+    # 10. unsupported model format
+    def test_10_unsupported_model_format(self) -> None:
+        app_dir = self._app_dir()
+        m = dict(VALID_MANIFEST)
+        m["models"][0]["format"] = "onnx"  # not in E1 whitelist
+        self._assert_rejected(app_dir, m, "not in e1 whitelist")
+
+
+if __name__ == "__main__":
+    unittest.main()

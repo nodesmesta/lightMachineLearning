@@ -1,0 +1,54 @@
+{
+  "manifest_version": 1,
+  "app_id": "dummy-app",
+  "name": "Dummy App",
+  "version": "1.0.0",
+  "capabilities": ["inference"],
+  "models": [
+    {
+      "role": "model",
+      "file": "models/dummy_model.pkl",
+      "format": "pickle",
+      "sha256": "afd3e4a94ed74babe84737b653600be5ed09b520e493e06b3d90d726a95f5edf"
+    }
+  ],
+  "adapter": {
+    "entry": "adapter/main.py",
+    "files": [
+      {
+        "file": "adapter/main.py",
+        "sha256": "415da0ce041184101237f86b4bf7fc66be30e3ea33f710b54729f23db9b9531b"
+      }
+    ]
+  },
+  "release": {
+    "key_id": "sydeco-test-key-v1",
+    "signature": "manifest.sig"
+  },
+  "input_schema": {
+    "type": "object",
+    "required": ["text"],
+    "properties": {
+      "text": {"type": "string", "maxLength": 100000}
+    }
+  },
+  "output_schema": {
+    "type": "object",
+    "required": ["status", "app_id"],
+    "properties": {
+      "status": {"type": "string"},
+      "app_id": {"type": "string"},
+      "echo": {"type": "string"}
+    }
+  },
+  "permissions": {"network": "none"},
+  "api": {"authentication": "token"},
+  "resource_limits": {
+    "max_memory": 1073741824,
+    "max_cpu": 100,
+    "inference_timeout": 120,
+    "concurrency": 1
+  },
+  "dependencies": [],
+  "inference": {"seed": 42}
+}
