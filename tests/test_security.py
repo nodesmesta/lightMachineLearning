@@ -20,6 +20,7 @@ event. Stdlib unittest only.
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
@@ -125,35 +126,35 @@ class SecurityTests(unittest.TestCase):
     # 3. invalid app_id (uppercase / spaces / too long)
     def test_03_invalid_app_id(self) -> None:
         app_dir = self._app_dir()
-        m = dict(VALID_MANIFEST)
+        m = copy.deepcopy(VALID_MANIFEST)
         m["app_id"] = "Bad_App ID"
         self._assert_rejected(app_dir, m, "app_id")
 
     # 4. unknown capability
     def test_04_unknown_capability(self) -> None:
         app_dir = self._app_dir()
-        m = dict(VALID_MANIFEST)
+        m = copy.deepcopy(VALID_MANIFEST)
         m["capabilities"] = ["inference", "teleport"]
         self._assert_rejected(app_dir, m, "unknown capability")
 
     # 5. missing adapter
     def test_05_missing_adapter(self) -> None:
         app_dir = self._app_dir()
-        m = dict(VALID_MANIFEST)
+        m = copy.deepcopy(VALID_MANIFEST)
         del m["adapter"]
         self._assert_rejected(app_dir, m, "missing required field: adapter")
 
     # 6. missing model
     def test_06_missing_model(self) -> None:
         app_dir = self._app_dir()
-        m = dict(VALID_MANIFEST)
+        m = copy.deepcopy(VALID_MANIFEST)
         m["models"] = []
         self._assert_rejected(app_dir, m, "models")
 
     # 7. incorrect SHA-256 (model file content does not match manifest hash)
     def test_07_incorrect_sha256(self) -> None:
         app_dir = self._app_dir()
-        m = dict(VALID_MANIFEST)
+        m = copy.deepcopy(VALID_MANIFEST)
         m["models"][0]["sha256"] = "f" * 64  # wrong hash
         self._assert_rejected(app_dir, m, "sha256 mismatch")
 
@@ -163,7 +164,7 @@ class SecurityTests(unittest.TestCase):
         # valid manifest, but a second model file exists undeclared
         with open(os.path.join(app_dir, "models", "extra.pkl"), "wb") as fh:
             fh.write(b"undeclared")
-        m = dict(VALID_MANIFEST)
+        m = copy.deepcopy(VALID_MANIFEST)
         # hash of declared model must match (real sha of "dummy-model")
         import hashlib
         real_sha = hashlib.sha256(b"dummy-model").hexdigest()
@@ -195,16 +196,45 @@ class SecurityTests(unittest.TestCase):
     # 9. path traversal ../../file
     def test_09_path_traversal(self) -> None:
         app_dir = self._app_dir()
-        m = dict(VALID_MANIFEST)
+        m = copy.deepcopy(VALID_MANIFEST)
         m["models"][0]["file"] = "../../etc/passwd"
         self._assert_rejected(app_dir, m, "escapes app dir")
 
     # 10. unsupported model format
     def test_10_unsupported_model_format(self) -> None:
         app_dir = self._app_dir()
-        m = dict(VALID_MANIFEST)
+        m = copy.deepcopy(VALID_MANIFEST)
         m["models"][0]["format"] = "onnx"  # not in E1 whitelist
         self._assert_rejected(app_dir, m, "not in e1 whitelist")
+
+    # 11. symlink escape (reviewer directive 19-08-2026; N2)
+    def test_11_symlink_escape(self) -> None:
+        """Artifact path syntactically inside the app directory -> the file
+        is a symbolic link pointing OUTSIDE the app directory -> the
+        installer MUST reject (N2 resolves filesystem symlinks via
+        realpath before the containment decision)."""
+        outside = os.path.join(self._tmp, "outside")
+        os.makedirs(outside, exist_ok=True)
+        outside_file = os.path.join(outside, "secret.pkl")
+        with open(outside_file, "wb") as fh:
+            fh.write(b"outside-secret-model")
+
+        app_dir = os.path.join(self._tmp, "app")
+        os.makedirs(os.path.join(app_dir, "models"), exist_ok=True)
+        os.makedirs(os.path.join(app_dir, "adapter"), exist_ok=True)
+        # symlink inside models/ whose target lives OUTSIDE app_dir
+        os.symlink(outside_file, os.path.join(app_dir, "models", "model.pkl"))
+        with open(os.path.join(app_dir, "adapter", "main.py"), "w", encoding="utf-8") as fh:
+            fh.write("class Adapter:\n    pass\n")
+
+        import hashlib
+
+        m = copy.deepcopy(VALID_MANIFEST)
+        m["models"][0]["sha256"] = hashlib.sha256(b"outside-secret-model").hexdigest()
+        m["adapter"]["files"][0]["sha256"] = hashlib.sha256(
+            b"class Adapter:\n    pass\n"
+        ).hexdigest()
+        self._assert_rejected(app_dir, m, "escapes app dir")
 
 
 if __name__ == "__main__":

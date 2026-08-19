@@ -1,0 +1,60 @@
+{
+  "manifest_version": 1,
+  "app_id": "text-classifier",
+  "name": "Text Classifier",
+  "version": "1.0.0",
+  "capabilities": ["inference"],
+  "models": [
+    {
+      "role": "vectorizer",
+      "file": "models/text_vectorizer.pkl",
+      "format": "pickle",
+      "sha256": "c90170bab43e260d73b67da1ae061b3a9d26359926783447e654d9684d15bd43"
+    },
+    {
+      "role": "model",
+      "file": "models/text_model.pkl",
+      "format": "pickle",
+      "sha256": "cee6ad44945a2382abcf938f8a93245613ac64f2ef704e46ae50ed580a4f54c6",
+      "depends_on": "vectorizer"
+    }
+  ],
+  "adapter": {
+    "entry": "adapter/main.py",
+    "files": [
+      {
+        "file": "adapter/main.py",
+        "sha256": "93f1468e00908354b739c8efae8a03a3029e09280e996290a8dc35f2af5eb20d"
+      }
+    ]
+  },
+  "release": {
+    "key_id": "sydeco-test-key-v1",
+    "signature": "manifest.sig"
+  },
+  "input_schema": {
+    "type": "object",
+    "required": ["text"],
+    "properties": {
+      "text": {"type": "string", "maxLength": 100000}
+    }
+  },
+  "output_schema": {
+    "type": "object",
+    "required": ["label", "confidence"],
+    "properties": {
+      "label": {"type": "string"},
+      "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+    }
+  },
+  "permissions": {"network": "none"},
+  "api": {"authentication": "token"},
+  "resource_limits": {
+    "max_memory": 1073741824,
+    "max_cpu": 100,
+    "inference_timeout": 120,
+    "concurrency": 1
+  },
+  "dependencies": [],
+  "inference": {"seed": 42}
+}

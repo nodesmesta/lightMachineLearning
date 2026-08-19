@@ -4,10 +4,16 @@ Root CLI, non-interactive, structured --json output; management
 operations serialized by an exclusive lock (N4).
 
 Day 1 commands:
-  sydeco-lightml app install <manifest.json> [--root <app_root>] [--json]
-  sydeco-lightml app list [--json]
-  sydeco-lightml app status <app_id> [--json]
-  sydeco-lightml app show <app_id> [--json]      (full registry entry)
+  sydeco-lightml install <manifest.json> [--root <app_root>] [--json]
+  sydeco-lightml list [--json]
+  sydeco-lightml status <app_id> [--json]
+  sydeco-lightml show <app_id> [--json]      (full registry entry)
+
+Day 2 commands:
+  sydeco-lightml start <app_id> [--json]     (start one app's worker)
+  sydeco-lightml stop <app_id> [--json]
+  sydeco-lightml crash <app_id> [--json]     (DEV-ONLY test hook: isolation)
+  sydeco-lightml serve [--host] [--port]     (HTTP surface, 5.1)
 """
 from __future__ import annotations
 
@@ -119,6 +125,40 @@ def cmd_show(service: CoreService, args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_action(service: CoreService, args: argparse.Namespace, action: str) -> int:
+    fn = {
+        "start": service.start_app,
+        "stop": service.stop_app,
+        "crash": service.crash_app,
+    }[action]
+    ok, message, data = fn(args.app_id)
+    if args.json:
+        out = {"ok": ok, "message": message}
+        if data:
+            out.update(data)
+        _print_json(out)
+    else:
+        print(message)
+    return 0 if ok else 1
+
+
+def cmd_start(service: CoreService, args: argparse.Namespace) -> int:
+    return _run_action(service, args, "start")
+
+
+def cmd_stop(service: CoreService, args: argparse.Namespace) -> int:
+    return _run_action(service, args, "stop")
+
+
+def cmd_crash(service: CoreService, args: argparse.Namespace) -> int:
+    return _run_action(service, args, "crash")
+
+
+def cmd_serve(service: CoreService, args: argparse.Namespace) -> int:
+    service.serve(host=args.host, port=args.port)
+    return 0  # unreachable while serving
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sydeco-lightml",
@@ -150,6 +190,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_show.add_argument("app_id")
     p_show.add_argument("--json", action="store_true")
     p_show.set_defaults(func=cmd_show)
+
+    p_start = sub.add_parser("start", help="start one app's worker")
+    p_start.add_argument("app_id")
+    p_start.add_argument("--json", action="store_true")
+    p_start.set_defaults(func=cmd_start)
+
+    p_stop = sub.add_parser("stop", help="stop one app's worker")
+    p_stop.add_argument("app_id")
+    p_stop.add_argument("--json", action="store_true")
+    p_stop.set_defaults(func=cmd_stop)
+
+    p_crash = sub.add_parser(
+        "crash", help="DEV-ONLY test hook: simulate a worker crash (isolation test)"
+    )
+    p_crash.add_argument("app_id")
+    p_crash.add_argument("--json", action="store_true")
+    p_crash.set_defaults(func=cmd_crash)
+
+    p_serve = sub.add_parser("serve", help="start the HTTP surface (5.1)")
+    p_serve.add_argument("--host", default="127.0.0.1")
+    p_serve.add_argument("--port", default=None, type=int)
+    p_serve.set_defaults(func=cmd_serve)
     return parser
 
 

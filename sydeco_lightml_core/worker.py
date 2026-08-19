@@ -13,6 +13,8 @@ grace (from resource_limits), then SIGKILL.
 from __future__ import annotations
 
 import abc
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Optional
 
 from .adapter import Adapter
@@ -80,3 +82,112 @@ class WorkerManager:
         except Exception:
             self.readiness.set(app_id, AppStatus.BACKOFF, detail="restart failed")
             raise
+
+
+class InferenceTimeout(Exception):
+    """M4: the adapter did not return within inference_timeout."""
+
+
+class WorkerNotReady(Exception):
+    """The worker is broken/stopped and cannot serve this request."""
+
+
+class InProcessWorkerHost(WorkerHost):
+    """A3 dev equivalent (user decision D4, 2026-08-19): in-process worker
+    host for the Day-2 PoCs.
+
+    Production hosting = one subprocess per capability, managed by the
+    Core supervisor with systemd/cgroup enforcement (proposal 2.3/A3,
+    Section 3.3 — later days). This host runs the Adapter in-process,
+    single-flight (M3, concurrency 1), with inference_timeout taken from
+    the manifest resource_limits (M4 -> InferenceTimeout -> 504 at the
+    serving layer).
+
+    `simulate_crash()` is a DEV-ONLY test hook (isolation test P6): it
+    marks the worker broken (readiness -> backoff) so the other app can
+    be shown unaffected. Not part of any production path.
+    """
+
+    def __init__(
+        self,
+        readiness: Optional[ReadinessStore] = None,
+        audit=None,
+    ) -> None:
+        self._app_id = ""
+        self._version = ""
+        self._adapter: Optional[Adapter] = None
+        self._context: Dict[str, Any] = {}
+        self._timeout = 120.0
+        self._broken = False
+        self._readiness = readiness
+        self._audit = audit
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="sydeco-worker"
+        )
+
+    def start(
+        self, app_id: str, version: str, adapter: Adapter, context: Dict[str, Any]
+    ) -> None:
+        self._app_id = app_id
+        self._version = version
+        self._adapter = adapter
+        self._context = dict(context)
+        rl = context.get("config", {}).get("resource_limits", {})
+        try:
+            self._timeout = float(rl.get("inference_timeout", 120))
+        except (TypeError, ValueError):
+            self._timeout = 120.0
+        self._broken = False
+        adapter.initialize(context)
+
+    def infer(self, request: Dict[str, Any], request_id: str) -> Any:
+        if self._broken or self._adapter is None:
+            raise WorkerNotReady(f"worker not ready: {self._app_id}")
+        context = dict(self._context)
+        context["request_id"] = request_id
+        future = self._executor.submit(self._adapter.infer, request, context)
+        try:
+            return future.result(timeout=self._timeout)
+        except concurrent.futures.TimeoutError:
+            raise InferenceTimeout(
+                f"inference timeout after {self._timeout:.0f}s: {self._app_id}"
+            )
+
+    def stop(self, app_id: str) -> None:
+        adapter = self._adapter
+        if adapter is not None:
+            try:
+                adapter.shutdown()
+            except Exception:
+                pass
+
+    def restart(self, app_id: str) -> None:
+        if self._adapter is None or not self._context:
+            raise RuntimeError(f"cannot restart {app_id}: never started")
+        self._broken = False
+        self._adapter.initialize(self._context)
+
+    def status(self, app_id: str) -> str:
+        if self._broken:
+            return AppStatus.BACKOFF.value
+        return AppStatus.READY.value if self._adapter is not None else AppStatus.IDLE.value
+
+    def simulate_crash(self) -> None:
+        """DEV-ONLY test hook: break this worker (isolation test P6)."""
+        self._broken = True
+        if self._readiness is not None:
+            self._readiness.set(
+                self._app_id, AppStatus.BACKOFF, detail="simulated crash (test hook)"
+            )
+        if self._audit is not None:
+            self._audit.append(
+                {
+                    "action": "worker_crash",
+                    "app_id": self._app_id,
+                    "version": self._version,
+                    "result": "simulated",
+                }
+            )
+
+    def shutdown(self) -> None:
+        self._executor.shutdown(wait=False)

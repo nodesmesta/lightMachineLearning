@@ -1,0 +1,57 @@
+{
+  "manifest_version": 1,
+  "app_id": "image-classifier",
+  "name": "Image Classifier",
+  "version": "1.0.0",
+  "capabilities": ["inference"],
+  "models": [
+    {
+      "role": "model",
+      "file": "models/image_model.joblib",
+      "format": "joblib",
+      "sha256": "dbd41ff5074f999804c574c4165b3cd21733a5aea0a73ada3b5949c75c8f1d36"
+    }
+  ],
+  "adapter": {
+    "entry": "adapter/main.py",
+    "files": [
+      {
+        "file": "adapter/main.py",
+        "sha256": "05e05750693c6ac2b05f6718163fc95a397b7693b85b19b7838ceeb92b10fe88"
+      }
+    ]
+  },
+  "release": {
+    "key_id": "sydeco-test-key-v1",
+    "signature": "manifest.sig"
+  },
+  "input_schema": {
+    "type": "object",
+    "required": ["image"],
+    "properties": {
+      "image": {
+        "type": "string",
+        "contentEncoding": "base64",
+        "maxLength": 1048576
+      }
+    }
+  },
+  "output_schema": {
+    "type": "object",
+    "required": ["label", "confidence"],
+    "properties": {
+      "label": {"type": "string"},
+      "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+    }
+  },
+  "permissions": {"network": "none"},
+  "api": {"authentication": "token"},
+  "resource_limits": {
+    "max_memory": 1073741824,
+    "max_cpu": 100,
+    "inference_timeout": 120,
+    "concurrency": 1
+  },
+  "dependencies": [],
+  "inference": {"seed": 42}
+}
