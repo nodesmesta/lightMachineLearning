@@ -63,6 +63,51 @@ SAME Core with ZERO Core source modifications between installations:
   day evidence `data/evidence_p5_hash_identity.txt`.
 - Isolation test: breaking PoC A leaves PoC B operational (503 vs 200).
 
+## Day 2 correction pass (20-08-2026)
+
+Reviewer directives (20-08-2026 review) implemented:
+
+- All test paths are now RELATIVE to the repository location
+  (`Path(__file__).resolve().parents[1]`) — no absolute
+  `/home/sydeco/Dev/...` paths anywhere in `tests/` (0 occurrences).
+- The oversized-payload test is now deterministic on Python 3.10 and
+  3.13: it declares `Content-Length` > 1 MiB WITHOUT transmitting the
+  oversized body (`tests/_http_harness.py::request_declared`) — the
+  server rejects at the edge (K5/H3) with a clean 400, no
+  client-side BrokenPipeError.
+- The full suite (27/27) is reproduced from a FRESH extraction into
+  /tmp with no dev paths present.
+
+## Day 3 scope (20-08-2026)
+
+PoC C + bundle security + failure testing:
+
+- **PoC C — document triage pipeline** (`examples/document-triage/`,
+  proposal 7.3/R9): the full workflow lives in the bundle's Adapter
+  (preprocessing -> topic model -> rule -> sentiment model ->
+  aggregation) -> structured result {topic, sentiment, urgency,
+  confidence}. Three stdlib-only pickle artifacts (vectorizer + topic
+  with `depends_on`, sentiment). `tests/test_poc_c.py` (7 tests).
+- **Ed25519 bundle signing (R6)** — mandatory: `devkeys/` holds the
+  TEST keypair
+  `DEVELOPMENT_TEST_KEY_DO_NOT_USE_IN_PRODUCTION` (private 0600);
+  `sydeco_lightml_core/keys.py` embeds the trusted PUBLIC key in Core
+  and verifies `release.signature` FIRST at install (unsigned / wrong
+  signature / unknown key_id -> rejected + audit); `tools/sign_bundle.py`
+  signs the canonical manifest. All three bundles (A/B/C) are signed.
+  `tests/test_signature.py` — 6 cases.
+- **10 failure tests** (`tests/test_failure.py`): adapter init failure,
+  adapter inference exception, inference timeout (504), worker crash,
+  malformed input, output not matching output_schema, model hash
+  mismatch, adapter hash mismatch, application unavailable, one app
+  fails while another stays healthy. Client errors always sanitized.
+- **Universal-runtime proof (PoC C)**: Core source hashes BEFORE vs
+  AFTER installing/running PoC C — identical 16/16 (user sha256sum),
+  see day evidence `data/evidence_p10_hash_identity_c.txt`.
+- Full suite: **50 tests, all PASS**, reproduced from a fresh
+  extraction (0 absolute paths; all 3 bundles' signatures verify
+  against the trusted Core key).
+
 ## Constraints
 
 - Stdlib-only (no pip install; validator + unittest). Needs no Internet
