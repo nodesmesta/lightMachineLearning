@@ -72,5 +72,41 @@ class HttpHarness:
             "POST", f"/api/v1/apps/{app_id}/infer", payload=payload, token=token
         )
 
+    def request_declared(
+        self,
+        method: str,
+        path: str,
+        declared_content_length: int,
+        token: Optional[str] = None,
+    ) -> tuple:
+        """Send a request whose Content-Length header is DECLARED larger
+        than the body actually transmitted (K5 edge test helper).
+
+        The server rejects on the declared length BEFORE reading the
+        body (400), so the client must not transmit the oversized body —
+        this makes the oversized-payload test deterministic on both
+        Python 3.10 and 3.13 (no client-side BrokenPipeError while the
+        server has already replied; reviewer directive 20-08-2026).
+        """
+        import http.client
+
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        headers["Content-Length"] = str(declared_content_length)
+        headers["Connection"] = "close"
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request(method, path, body=b"", headers=headers)
+            resp = conn.getresponse()
+            raw = resp.read()
+            status = resp.status
+        finally:
+            conn.close()
+        try:
+            return status, json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, ValueError):
+            return status, raw
+
     def get(self, path: str, token: Optional[str] = None) -> tuple:
         return self.request("GET", path, token=token)

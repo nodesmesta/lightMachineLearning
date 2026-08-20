@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from pathlib import Path
 import shutil
 import tempfile
 import unittest
@@ -26,7 +27,8 @@ from sydeco_lightml_core.core import CoreService
 
 from tests._http_harness import HttpHarness
 
-BASE_EXAMPLES = "/home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/examples"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+BASE_EXAMPLES = str(REPO_ROOT / "examples")
 BUNDLES = {
     "text-classifier": os.path.join(BASE_EXAMPLES, "text-classifier"),
     "image-classifier": os.path.join(BASE_EXAMPLES, "image-classifier"),

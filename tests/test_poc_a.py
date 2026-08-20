@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from pathlib import Path
 import shutil
 import tempfile
 import unittest
@@ -21,7 +22,8 @@ from sydeco_lightml_core.core import CoreService
 
 from tests._http_harness import HttpHarness
 
-BUNDLE = "/home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/examples/text-classifier"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+BUNDLE = str(REPO_ROOT / "examples" / "text-classifier")
 
 
 def sha256_file(path: str) -> str:

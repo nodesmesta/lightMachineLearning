@@ -15,6 +15,7 @@ import base64
 import hashlib
 import json
 import os
+from pathlib import Path
 import shutil
 import tempfile
 import unittest
@@ -23,7 +24,8 @@ from sydeco_lightml_core.core import CoreService
 
 from tests._http_harness import HttpHarness, make_pgm
 
-BUNDLE = "/home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/examples/image-classifier"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+BUNDLE = str(REPO_ROOT / "examples" / "image-classifier")
 
 
 def sha256_file(path: str) -> str:
@@ -113,8 +115,15 @@ class TestPocB(unittest.TestCase):
 
     # 3. oversized payload (> 1 MiB body limit, K5/H3) -> 400 at the edge
     def test_03_oversized_payload(self) -> None:
-        status, body = self.http.infer(
-            "image-classifier", {"image": "A" * 1_500_000}, self.token
+        # Deterministic on 3.10 AND 3.13 (reviewer directive 20-08-2026):
+        # declare Content-Length > 1 MiB but transmit NO oversized body;
+        # the server rejects on the DECLARED length before reading the
+        # body (edge, H3) -> 400, so the client never hits a broken pipe.
+        status, body = self.http.request_declared(
+            "POST",
+            "/api/v1/apps/image-classifier/infer",
+            declared_content_length=1_500_000,
+            token=self.token,
         )
         self.assertEqual(status, 400, body)
         self.assertIn("size limit", body["error"]["message"])
