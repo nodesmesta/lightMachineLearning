@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .audit import JsonlAuditBackend
 from .health import AppStatus, ReadinessStore
+from .keys import verify_bundle_signature
 from .loader import load_artifacts
 from .manifest import load_manifest
 from .registry import Registry, default_data_dir
@@ -51,9 +52,13 @@ class CoreService:
         """Install/register an app from its manifest.
 
         Returns (ok, message, registry_entry). Flow (proposal 3.1 steps
-        2+4+5+7+10 for Day 1 - signature, extraction, wheelhouse and
-        unit generation belong to the full installer on later days):
+        1+2+4+5+7+10 for Day 1 - extraction, wheelhouse and unit
+        generation belong to the full installer on later days):
           1. load manifest (missing/invalid JSON -> reject)
+          1b. verify SYDECO signature over the canonical manifest (R6,
+              Day 3 - MANDATORY: unsigned / wrong signature / unknown
+              key_id -> reject + audit) BEFORE any bundle code or data
+              is used
           2. validate manifest (I2, reject malformed/incomplete)
           3. verify artifacts (E5) present + hash match
           4. register in registry (F1) + audit
@@ -66,6 +71,28 @@ class CoreService:
                 {"action": "install", "app_id": "", "result": "fail", "reason": str(exc)}
             )
             return False, f"install rejected: {exc}", None
+
+        # Step 1b (R6, Day 3): signature verified FIRST — before any
+        # bundle code or data is used (proposal 3.1 step 1 / 3.4).
+        # Signed SYDECO bundles are MANDATORY (R6).
+        app_root = os.path.realpath(
+            os.path.abspath(app_root or os.path.dirname(manifest_path))
+        )
+        release = manifest.get("release", {})
+        sig_name = release.get("signature", "manifest.sig")
+        sig_path = os.path.join(app_root, sig_name)
+        ok_sig, sig_reason = verify_bundle_signature(manifest, sig_path)
+        if not ok_sig:
+            self.audit.append(
+                {
+                    "action": "install",
+                    "app_id": manifest.get("app_id", ""),
+                    "result": "fail",
+                    "reason": "signature verification failed (R6)",
+                    "detail": sig_reason,
+                }
+            )
+            return False, f"install rejected: {sig_reason}", None
 
         # Step 2: validate manifest
         ok, errors = validate_manifest(manifest)
@@ -89,7 +116,6 @@ class CoreService:
         # resolves filesystem symlinks (realpath) BEFORE the prefix check —
         # a path that is syntactically inside app_root but resolves outside
         # via a symlink is REJECTED.
-        app_root = os.path.realpath(os.path.abspath(app_root or os.path.dirname(manifest_path)))
         hashes: Dict[str, str] = {}
         for model in manifest.get("models", []):
             rel = model.get("file", "")

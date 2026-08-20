@@ -29,6 +29,8 @@ import unittest
 
 from sydeco_lightml_core.core import CoreService
 
+from tests._signing import sign_manifest
+
 VALID_MANIFEST = {
     "manifest_version": 1,
     "app_id": "sec-test-app",
@@ -95,6 +97,9 @@ class SecurityTests(unittest.TestCase):
         path = os.path.join(app_dir, "manifest.json")
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(manifest, fh)
+        # R6 (Day 3): valid-JSON manifests must be signed to reach the
+        # validation/artifact checks (signature verified FIRST).
+        sign_manifest(app_dir)
         return path
 
     def _assert_rejected(self, app_dir: str, manifest: dict, expect_reason: str) -> None:

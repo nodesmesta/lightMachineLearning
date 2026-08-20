@@ -26,6 +26,7 @@ import unittest
 from sydeco_lightml_core.core import CoreService
 
 from tests._http_harness import HttpHarness
+from tests._signing import sign_manifest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BASE_EXAMPLES = str(REPO_ROOT / "examples")
@@ -52,6 +53,7 @@ def _patch_manifest_hashes(bundle: str) -> None:
         f["sha256"] = sha256_file(os.path.join(bundle, f["file"]))
     with open(os.path.join(bundle, "manifest.json"), "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2)
+    sign_manifest(bundle)  # R6: bundle must be signed to install
 
 
 class TestIsolation(unittest.TestCase):

@@ -23,6 +23,7 @@ import unittest
 from sydeco_lightml_core.core import CoreService
 
 from tests._http_harness import HttpHarness, make_pgm
+from tests._signing import sign_manifest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BUNDLE = str(REPO_ROOT / "examples" / "image-classifier")
@@ -58,6 +59,7 @@ class TestPocB(unittest.TestCase):
         )
         with open(os.path.join(self.bundle, "manifest.json"), "w", encoding="utf-8") as fh:
             json.dump(manifest, fh, indent=2)
+        sign_manifest(self.bundle)  # R6: bundle must be signed to install
 
         ok, message, entry = self.service.install_app(
             os.path.join(self.bundle, "manifest.json"), app_root=self.bundle

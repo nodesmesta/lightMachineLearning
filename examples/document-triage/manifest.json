@@ -1,7 +1,7 @@
 {
   "manifest_version": 1,
-  "app_id": "text-classifier",
-  "name": "Text Classifier",
+  "app_id": "document-triage",
+  "name": "Document Triage Pipeline",
   "version": "1.0.0",
   "capabilities": [
     "inference"
@@ -9,16 +9,22 @@
   "models": [
     {
       "role": "vectorizer",
-      "file": "models/text_vectorizer.pkl",
+      "file": "models/triage_vectorizer.pkl",
       "format": "pickle",
-      "sha256": "c90170bab43e260d73b67da1ae061b3a9d26359926783447e654d9684d15bd43"
+      "sha256": "bb3abb646c7cea250de755f572d9285eff4ddf5b460b3ada9fa7355c930167c1"
     },
     {
-      "role": "model",
-      "file": "models/text_model.pkl",
+      "role": "topic",
+      "file": "models/triage_topic.pkl",
       "format": "pickle",
-      "sha256": "cee6ad44945a2382abcf938f8a93245613ac64f2ef704e46ae50ed580a4f54c6",
+      "sha256": "2b167d06f8840466d52ca84c23dbb7974e6cbadabad86237aa15536c07ca6f64",
       "depends_on": "vectorizer"
+    },
+    {
+      "role": "sentiment",
+      "file": "models/triage_sentiment.pkl",
+      "format": "pickle",
+      "sha256": "c6b1ca0ec2cc91eeeb48fd314c5a0e7f7f9d8b7015c72a31d7e10304efc958d3"
     }
   ],
   "adapter": {
@@ -26,7 +32,7 @@
     "files": [
       {
         "file": "adapter/main.py",
-        "sha256": "93f1468e00908354b739c8efae8a03a3029e09280e996290a8dc35f2af5eb20d"
+        "sha256": "d0e31f9ead25ccf5afacb241b0d8877f38f2257cc583aaf3ebdc4b8e15e85bcf"
       }
     ]
   },
@@ -49,12 +55,29 @@
   "output_schema": {
     "type": "object",
     "required": [
-      "label",
+      "topic",
+      "sentiment",
+      "urgency",
       "confidence"
     ],
     "properties": {
-      "label": {
+      "topic": {
         "type": "string"
+      },
+      "sentiment": {
+        "type": "string",
+        "enum": [
+          "positive",
+          "negative"
+        ]
+      },
+      "urgency": {
+        "type": "string",
+        "enum": [
+          "low",
+          "high",
+          "review"
+        ]
       },
       "confidence": {
         "type": "number",
@@ -70,7 +93,7 @@
     "authentication": "token"
   },
   "resource_limits": {
-    "max_memory": 1073741824,
+    "max_memory": 2147483648,
     "max_cpu": 100,
     "inference_timeout": 120,
     "concurrency": 1
