@@ -69,7 +69,7 @@ Reviewer directives (20-08-2026 review) implemented:
 
 - All test paths are now RELATIVE to the repository location
   (`Path(__file__).resolve().parents[1]`) — no absolute
-  `/home/sydeco/Dev/...` paths anywhere in `tests/` (0 occurrences).
+  development paths anywhere in `tests/` (0 occurrences).
 - The oversized-payload test is now deterministic on Python 3.10 and
   3.13: it declares `Content-Length` > 1 MiB WITHOUT transmitting the
   oversized body (`tests/_http_harness.py::request_declared`) — the
@@ -104,7 +104,7 @@ PoC C + bundle security + failure testing:
 - **Universal-runtime proof (PoC C)**: Core source hashes BEFORE vs
   AFTER installing/running PoC C — identical 16/16 (user sha256sum),
   see day evidence `data/evidence_p10_hash_identity_c.txt`.
-- Full suite: **50 tests, all PASS**, reproduced from a fresh
+- Full suite: **51 tests, all PASS**, reproduced from a fresh
   extraction (0 absolute paths; all 3 bundles' signatures verify
   against the trusted Core key).
 

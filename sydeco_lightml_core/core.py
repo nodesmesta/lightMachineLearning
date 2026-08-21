@@ -80,7 +80,29 @@ class CoreService:
         )
         release = manifest.get("release", {})
         sig_name = release.get("signature", "manifest.sig")
-        sig_path = os.path.join(app_root, sig_name)
+        sig_path = os.path.realpath(
+            os.path.abspath(os.path.normpath(os.path.join(app_root, sig_name)))
+        )
+        # N2 containment — SAME rule as model/adapter artifacts
+        # (reviewer finding 4, 21-08-2026): the signature file must
+        # resolve STRICTLY INSIDE app_root before it is opened. A path
+        # that is syntactically inside but resolves outside via
+        # traversal or a symlink is REJECTED + audit.
+        if not sig_path.startswith(app_root + os.sep):
+            self.audit.append(
+                {
+                    "action": "install",
+                    "app_id": manifest.get("app_id", ""),
+                    "result": "fail",
+                    "reason": "path traversal",
+                    "artifact": sig_name,
+                }
+            )
+            return (
+                False,
+                f"install rejected: signature path escapes app dir: {sig_name}",
+                None,
+            )
         ok_sig, sig_reason = verify_bundle_signature(manifest, sig_path)
         if not ok_sig:
             self.audit.append(

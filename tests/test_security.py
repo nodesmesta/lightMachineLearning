@@ -241,6 +241,70 @@ class SecurityTests(unittest.TestCase):
         ).hexdigest()
         self._assert_rejected(app_dir, m, "escapes app dir")
 
+    # 12. signature path escape (reviewer finding 4, 21-08-2026)
+    def test_12_signature_path_escape(self) -> None:
+        """release.signature must obey the SAME N2 containment as model
+        artifacts: the signature-file path is resolved with realpath and
+        must remain strictly inside the app dir BEFORE it is opened.
+        Sub-case (i): traversal string ../../<file>.
+        Sub-case (ii): manifest.sig is a symlink pointing OUTSIDE."""
+        import hashlib
+
+        # sub-case (i): "../" traversal in release.signature
+        outside = os.path.join(self._tmp, "outside.sig")
+        with open(outside, "w", encoding="ascii") as fh:
+            fh.write("AAAA")  # arbitrary bytes; must never be read
+
+        app_dir = os.path.join(self._tmp, "app_trav")
+        os.makedirs(os.path.join(app_dir, "models"), exist_ok=True)
+        os.makedirs(os.path.join(app_dir, "adapter"), exist_ok=True)
+        with open(os.path.join(app_dir, "models", "model.pkl"), "wb") as fh:
+            fh.write(b"dummy-model")
+        with open(os.path.join(app_dir, "adapter", "main.py"), "w", encoding="utf-8") as fh:
+            fh.write("class Adapter:\n    pass\n")
+
+        m = copy.deepcopy(VALID_MANIFEST)
+        m["app_id"] = "sig-trav-app"
+        m["models"][0]["sha256"] = hashlib.sha256(b"dummy-model").hexdigest()
+        m["adapter"]["files"][0]["sha256"] = hashlib.sha256(
+            b"class Adapter:\n    pass\n"
+        ).hexdigest()
+        m["release"] = {"key_id": "sydeco-test-key-v1", "signature": "../outside.sig"}
+        path = os.path.join(app_dir, "manifest.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(m, fh)
+        # signature is verified FIRST: the containment check runs before
+        # the file is opened -> rejected even though the manifest JSON is
+        # valid.
+        ok, message, entry = self.service.install_app(path)
+        self.assertFalse(ok, f"expected rejection, got ok with {message!r}")
+        self.assertIn("escapes app dir", message.lower())
+        self.assertIsNone(entry)
+
+        # sub-case (ii): manifest.sig is a symlink pointing outside
+        app_dir2 = os.path.join(self._tmp, "app_sym")
+        os.makedirs(os.path.join(app_dir2, "models"), exist_ok=True)
+        os.makedirs(os.path.join(app_dir2, "adapter"), exist_ok=True)
+        with open(os.path.join(app_dir2, "models", "model.pkl"), "wb") as fh:
+            fh.write(b"dummy-model")
+        with open(os.path.join(app_dir2, "adapter", "main.py"), "w", encoding="utf-8") as fh:
+            fh.write("class Adapter:\n    pass\n")
+        os.symlink(outside, os.path.join(app_dir2, "manifest.sig"))
+
+        m2 = copy.deepcopy(VALID_MANIFEST)
+        m2["app_id"] = "sig-sym-app"
+        m2["models"][0]["sha256"] = hashlib.sha256(b"dummy-model").hexdigest()
+        m2["adapter"]["files"][0]["sha256"] = hashlib.sha256(
+            b"class Adapter:\n    pass\n"
+        ).hexdigest()
+        path2 = os.path.join(app_dir2, "manifest.json")
+        with open(path2, "w", encoding="utf-8") as fh:
+            json.dump(m2, fh)
+        ok2, message2, entry2 = self.service.install_app(path2)
+        self.assertFalse(ok2, f"expected rejection, got ok with {message2!r}")
+        self.assertIn("escapes app dir", message2.lower())
+        self.assertIsNone(entry2)
+
 
 if __name__ == "__main__":
     unittest.main()
