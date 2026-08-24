@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import abc
 import concurrent.futures
+import json
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Optional
 
@@ -25,7 +27,7 @@ class WorkerHost(abc.ABC):
     """Abstract worker host: start / stop / restart one capability worker."""
 
     @abc.abstractmethod
-    def start(self, app_id: str, version: str, adapter: Adapter, context: Dict[str, Any]) -> None:
+    def start(self, app_id: str, version: str, adapter: Optional[Adapter], context: Dict[str, Any]) -> None:
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -126,8 +128,9 @@ class InProcessWorkerHost(WorkerHost):
         )
 
     def start(
-        self, app_id: str, version: str, adapter: Adapter, context: Dict[str, Any]
+        self, app_id: str, version: str, adapter: Optional[Adapter], context: Dict[str, Any]
     ) -> None:
+        assert adapter is not None, "InProcessWorkerHost requires an adapter"
         self._app_id = app_id
         self._version = version
         self._adapter = adapter
@@ -191,3 +194,470 @@ class InProcessWorkerHost(WorkerHost):
 
     def shutdown(self) -> None:
         self._executor.shutdown(wait=False)
+
+
+def allocate_port(host: str = "127.0.0.1") -> int:
+    """D2 req 1 (user decision 2026-08-24): CORE assigns the worker's
+    loopback endpoint before launch. Best-effort free-port probe on
+    127.0.0.1 (small bind race is acceptable in the dev harness)."""
+    import socket
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind((host, 0))
+        return int(s.getsockname()[1])
+    finally:
+        s.close()
+
+
+class SystemdTransientWorkerHost(WorkerHost):
+    """A3/3.3 production-path worker host (D1c, user decision 2026-08-24).
+
+    Each capability worker runs as a systemd TRANSIENT unit launched via
+    ``systemd-run``, so systemd owns the process AND its cgroup. No
+    permanent unit files / daemon-reload / enable today; the property
+    set is 1:1 reusable by the production unit file on a later day.
+
+    Core-side responsibilities:
+    - assign the worker loopback port BEFORE launch (D2 req 1)
+    - launch the unit with the manifest-derived properties: User=
+      (dedicated capability OS user, D3a), MemoryMax + MemoryOOMGroup,
+      CPUQuota, TasksMax, ProtectSystem=strict, PrivateTmp,
+      NoNewPrivileges, RestrictAddressFamilies, Restart=on-failure,
+      StartLimitBurst/StartLimitIntervalSec (crash-loop backoff),
+      TimeoutStopSec (bounded shutdown)
+    - poll GET /health/ready on 127.0.0.1:<port> (G1, G3 bounded wait)
+    - forward inference via HTTP with the manifest inference_timeout
+      (M4); expiry -> InferenceTimeout -> 504 at the serving layer
+    - monitor the unit state and emit the GRANULAR C2 audit events:
+      MEMORY_LIMIT_EXCEEDED (Result=oom-kill), CPU_THROTTLED (cpu.stat
+      nr_throttled), PID_LIMIT_REACHED (pids.current >= pids.max),
+      WORKER_CRASH (unit failed), WORKER_RESTART (NRestarts increased),
+      CRASH_LOOP_DETECTED (Result=start-limit-hit)
+    - bounded stop: systemctl stop (SIGTERM + TimeoutStopSec grace),
+      then SIGKILL fallback
+
+    Requires root (systemd-run against the system manager); used by the
+    privileged acceptance harness. InProcessWorkerHost stays the default
+    for the non-privileged unit tests (no regression, acceptance 12).
+    """
+
+    def __init__(
+        self,
+        readiness: Optional[ReadinessStore] = None,
+        audit=None,
+        *,
+        grace_seconds: float = 30.0,
+        poll_interval: float = 0.5,
+        ready_wait: float = 30.0,
+        unit_prefix: str = "sydeco-cap",
+    ) -> None:
+        self._readiness = readiness
+        self._audit = audit
+        self._grace_seconds = float(grace_seconds)
+        self._poll_interval = float(poll_interval)
+        self._ready_wait = float(ready_wait)
+        self._unit_prefix = unit_prefix
+        self._app_id = ""
+        self._version = ""
+        self._unit = ""
+        self._port = 0
+        self._timeout = 120.0
+        self._started = False
+        self._ready = False
+        self._last_context: Dict[str, Any] = {}
+        self._monitor = None
+        self._stop_event = None
+        self._last_nrestarts = 0
+        self._last_throttled = 0
+        self._pids_flagged = False
+
+    # ---- lifecycle -----------------------------------------------------
+
+    def start(
+        self, app_id: str, version: str, adapter: Optional[Adapter],
+        context: Dict[str, Any],
+    ) -> None:
+        """Launch the worker as a systemd transient unit and wait ready.
+
+        ``adapter`` is None in systemd mode (the adapter lives INSIDE the
+        worker process — Core never imports it); context carries the
+        paths: app_root, config (manifest), data_dir, port, user,
+        python (optional).
+        """
+        import subprocess
+
+        self._app_id = app_id
+        self._version = version
+        self._port = int(context["port"])
+        manifest = context.get("config", {})
+        rl = manifest.get("resource_limits", {})
+        try:
+            self._timeout = float(rl.get("inference_timeout", 120))
+        except (TypeError, ValueError):
+            self._timeout = 120.0
+        user = context.get("user", "")
+        app_root = context["app_root"]
+        data_dir = context.get("data_dir")
+        cwd = context.get("cwd", "")
+        pythonpath = context.get("pythonpath", "")
+        unit = f"{self._unit_prefix}-{app_id}"
+        self._unit = unit
+        self._last_context = dict(context)
+
+        python = context.get("python", sys.executable)
+        cmd = [
+            python, "-m", "sydeco_lightml_core.worker_runtime",
+            "--app-root", app_root, "--port", str(self._port),
+        ]
+        if data_dir:
+            cmd += ["--data-dir", data_dir]
+
+        max_memory = rl.get("max_memory")
+        props = []
+        if user:
+            props.append(f"User={user}")
+        if max_memory:
+            props.append(f"MemoryMax={int(max_memory)}")
+            # MemorySwapMax=0 makes MemoryMax a TRUE hard limit: without
+            # it the kernel throttles the worker at the limit instead of
+            # OOM-killing when swap is available (verified 2026-08-24).
+            props.append("MemorySwapMax=0")
+        # systemd 249 (this host): OOMPolicy=kill makes systemd SIGKILL
+        # the unit's processes when the cgroup hits MemoryMax (the
+        # whole worker workload dies, no orphan children — the
+        # MemoryOOMGroup equivalent on older systemd). OOMScoreAdjust
+        # biases the OOM killer towards the worker.
+        props.append("OOMPolicy=kill")
+        props.append("OOMScoreAdjust=1000")
+        props.append(f"CPUQuota={rl.get('max_cpu', 100)}%")
+        props.append(f"TasksMax={rl.get('max_tasks', 64)}")
+        props += [
+            "ProtectSystem=strict",
+            "PrivateTmp=yes",
+            "NoNewPrivileges=yes",
+            "RestrictAddressFamilies=AF_INET",
+            "Restart=on-failure",
+            "StartLimitBurst=3",
+            "StartLimitIntervalSec=10",
+            f"TimeoutStopSec={int(self._grace_seconds)}",  # seconds (249 shows '30s')
+        ]
+        if data_dir:
+            # R7a / L4: the app's OWN data dir is the ONLY writable path
+            # under ProtectSystem=strict (production pattern 3.3).
+            props.append(f"ReadWritePaths={data_dir}")
+        if cwd:
+            props.append(f"WorkingDirectory={cwd}")
+        if pythonpath:
+            props.append(f"Environment=PYTHONPATH={pythonpath}")
+
+        argv = (
+            ["systemd-run", f"--unit={unit}"]
+            + [f"--property={p}" for p in props]
+            + ["--", *cmd]
+        )
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"systemd-run failed for {app_id}: "
+                f"{(proc.stderr or proc.stdout).strip()}"
+            )
+        self._started = True
+        self._ready = False
+        self._last_nrestarts = 0
+        self._last_throttled = 0
+        self._pids_flagged = False
+        self._oom_checked = False
+        self._start_monitor()
+        if not self._wait_ready():
+            self._audit_event("WORKER_CRASH", detail="worker not ready within wait")
+            raise RuntimeError(
+                f"worker {app_id} not ready within {self._ready_wait:.0f}s"
+            )
+        self._ready = True
+
+    def stop(self, app_id: str) -> None:
+        """Bounded stop: SIGTERM + TimeoutStopSec grace, SIGKILL fallback."""
+        import subprocess
+
+        self._stop_monitor()
+        if not self._started:
+            return
+        unit = self._unit + ".service"
+        subprocess.run(
+            ["systemctl", "stop", unit],
+            capture_output=True, text=True, timeout=60,
+        )
+        out = subprocess.run(
+            ["systemctl", "show", unit, "-p", "ActiveState", "--value"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if out.stdout.strip() in ("active", "activating", "reloading"):
+            subprocess.run(
+                ["systemctl", "kill", "-s", "SIGKILL", unit],
+                capture_output=True, text=True, timeout=30,
+            )
+        self._started = False
+        self._ready = False
+        if self._readiness is not None:
+            self._readiness.set(app_id, AppStatus.IDLE)
+
+    def restart(self, app_id: str) -> None:
+        """Stop then start again with the stored context."""
+        if not self._started or not self._last_context:
+            raise RuntimeError(f"cannot restart {app_id}: never started")
+        ctx = dict(self._last_context)
+        self.stop(app_id)
+        self.start(app_id, self._version, None, ctx)
+
+    def status(self, app_id: str) -> str:
+        if not self._started:
+            return AppStatus.IDLE.value
+        return AppStatus.READY.value if self._ready else AppStatus.LOADING.value
+
+    def simulate_crash(self) -> None:
+        """DEV-ONLY test hook: SIGKILL the worker (isolation / restart
+        acceptance). systemd Restart=on-failure brings it back; the
+        monitor audits WORKER_CRASH + WORKER_RESTART."""
+        import subprocess
+
+        if self._started:
+            subprocess.run(
+                ["systemctl", "kill", "-s", "SIGKILL", self._unit + ".service"],
+                capture_output=True, text=True, timeout=30,
+            )
+
+    def shutdown(self) -> None:
+        self._stop_monitor()
+        self._started = False
+
+    # ---- inference forwarding (M4 at the Core edge) --------------------
+
+    def infer(self, request: Dict[str, Any], request_id: str) -> Any:
+        """Forward to the worker on 127.0.0.1:<port> with the manifest
+        inference_timeout; expiry -> InferenceTimeout (504 upstream)."""
+        import http.client
+        import socket
+
+        if not self._started or not self._ready:
+            raise WorkerNotReady(f"worker not ready: {self._app_id}")
+        body = json.dumps(request).encode("utf-8")
+        try:
+            conn = http.client.HTTPConnection(
+                "127.0.0.1", self._port, timeout=self._timeout
+            )
+            conn.request(
+                "POST", "/infer", body=body,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            data = resp.read()
+            conn.close()
+        except socket.timeout:
+            self._audit_event(
+                "INFERENCE_TIMEOUT",
+                detail=f"no response within {self._timeout:.0f}s",
+            )
+            raise InferenceTimeout(
+                f"inference timeout after {self._timeout:.0f}s: {self._app_id}"
+            )
+        except (ConnectionRefusedError, ConnectionResetError, OSError):
+            raise WorkerNotReady(f"worker unreachable: {self._app_id}")
+        try:
+            obj = json.loads(data.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise WorkerNotReady(f"worker returned invalid response: {self._app_id}")
+        if resp.status != 200:
+            raise RuntimeError(
+                f"worker error {resp.status}: {obj.get('error', obj)}"
+            )
+        return obj["result"]
+
+    # ---- readiness polling (G1) ----------------------------------------
+
+    def _wait_ready(self) -> bool:
+        import http.client
+        import time
+
+        deadline = time.time() + self._ready_wait
+        while time.time() < deadline:
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", self._port, timeout=2)
+                conn.request("GET", "/health/ready")
+                resp = conn.getresponse()
+                resp.read()
+                conn.close()
+                if resp.status == 200:
+                    return True
+            except Exception:
+                pass
+            time.sleep(self._poll_interval)
+        return False
+
+    # ---- supervision / audit ------------------------------------------
+
+    def _start_monitor(self) -> None:
+        import threading
+
+        self._stop_event = threading.Event()
+        self._monitor = threading.Thread(
+            target=self._monitor_loop, daemon=True,
+            name=f"sydeco-mon-{self._app_id}",
+        )
+        self._monitor.start()
+
+    def _stop_monitor(self) -> None:
+        if self._stop_event is not None:
+            self._stop_event.set()
+        if self._monitor is not None:
+            self._monitor.join(timeout=2.0)
+        self._monitor = None
+        self._stop_event = None
+
+    def _monitor_loop(self) -> None:
+        while self._stop_event is not None and not self._stop_event.is_set():
+            try:
+                self._check_unit_state()
+            except Exception:
+                pass
+            self._stop_event.wait(self._poll_interval * 2)
+
+    def _check_unit_state(self) -> None:
+        import os
+        import subprocess
+
+        if not self._started:
+            return
+        # full unit name (".service" suffix) — `systemctl show` without
+        # it can fail to resolve the transient unit -> empty output.
+        unit = self._unit + ".service"
+        show = subprocess.run(
+            ["systemctl", "show", unit,
+             "-p", "ActiveState", "-p", "Result", "-p", "NRestarts"],
+            capture_output=True, text=True, timeout=15,
+        )
+        # parse per-property (no --value): robust to EMPTY values — with
+        # --value a trailing empty property disappears from splitlines()
+        # and the old len()<4 guard silently dropped the whole check
+        # (monitor never audited WORKER_RESTART on an ACTIVE unit).
+        props: Dict[str, str] = {}
+        for line in show.stdout.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                props[k] = v
+        active = props.get("ActiveState", "")
+        result = props.get("Result", "")
+        try:
+            n = int(props.get("NRestarts", "0"))
+        except ValueError:
+            n = self._last_nrestarts
+        if n > self._last_nrestarts:
+            self._last_nrestarts = n
+            self._audit_event("WORKER_RESTART", detail=f"systemd NRestarts={n}")
+
+        if active == "failed":
+            oom = result == "oom-kill"
+            if not oom and not self._oom_checked:
+                # Result=oom-kill can be overwritten by a fast
+                # Restart=on-failure cycle (next Result=signal) — check
+                # the journal ONCE per start for the OOM marker.
+                oom = self._journal_says_oom()
+                self._oom_checked = True
+            if oom:
+                self._audit_event(
+                    "MEMORY_LIMIT_EXCEEDED",
+                    detail="cgroup OOM kill (MemoryMax + OOMPolicy=kill)",
+                )
+            elif result == "start-limit-hit" or n >= 3:
+                # crash-loop: systemd stopped restarting (StartLimitBurst
+                # reached) OR the unit has already restarted >=3 times
+                # and is now failed — protection engaged.
+                self._audit_event(
+                    "CRASH_LOOP_DETECTED",
+                    detail=f"unit failed after {n} restarts, Result={result}",
+                )
+            else:
+                self._audit_event(
+                    "WORKER_CRASH", detail=f"unit failed, Result={result}"
+                )
+            if self._ready:
+                self._ready = False
+                if self._readiness is not None:
+                    self._readiness.set(
+                        self._app_id, AppStatus.BACKOFF, detail="worker failed"
+                    )
+
+        # CPU_THROTTLED: cgroup cpu.stat throttling counters (CPUQuota
+        # semantics = THROTTLE, never termination — locked 2026-08-24).
+        cgroup = f"/sys/fs/cgroup/system.slice/{self._unit}.service"
+        cpu_stat = os.path.join(cgroup, "cpu.stat")
+        if os.path.isfile(cpu_stat):
+            try:
+                with open(cpu_stat, "r", encoding="utf-8") as fh:
+                    data = {
+                        parts[0]: parts[1]
+                        for line in fh
+                        if (parts := line.split()) and len(parts) == 2
+                    }
+                nr = int(data.get("nr_throttled", 0))
+                if nr > self._last_throttled:
+                    self._last_throttled = nr
+                    self._audit_event(
+                        "CPU_THROTTLED", detail=f"nr_throttled={nr}"
+                    )
+            except (OSError, ValueError):
+                pass
+
+        # PID_LIMIT_REACHED: pids.max hit (blocking, not killing).
+        pids_max = os.path.join(cgroup, "pids.max")
+        pids_cur = os.path.join(cgroup, "pids.current")
+        if os.path.isfile(pids_max) and os.path.isfile(pids_cur):
+            try:
+                with open(pids_max, "r", encoding="utf-8") as fh:
+                    pmax = fh.read().strip()
+                with open(pids_cur, "r", encoding="utf-8") as fh:
+                    pcur = fh.read().strip()
+                if pmax != "max" and pmax.isdigit() and not self._pids_flagged:
+                    if int(pcur) >= int(pmax):
+                        self._pids_flagged = True
+                        self._audit_event(
+                            "PID_LIMIT_REACHED",
+                            detail=f"pids.current={pcur} >= pids.max={pmax}",
+                        )
+            except OSError:
+                pass
+
+    def _journal_says_oom(self) -> bool:
+        """True when the unit journal records an OOM-kill event.
+
+        systemd journal line: "<unit>: A process of this unit has been
+        killed by the OOM killer." Used when Result=oom-kill was
+        overwritten by a fast Restart=on-failure cycle.
+        """
+        import subprocess
+
+        try:
+            out = subprocess.run(
+                ["journalctl", "-u", self._unit + ".service",
+                 "--no-pager", "-o", "cat", "-n", "200"],
+                capture_output=True, text=True, timeout=10,
+            )
+            return "killed by the OOM killer" in out.stdout
+        except Exception:
+            return False
+
+    def _audit_event(self, event: str, detail: str = "") -> None:
+        if self._audit is None:
+            return
+        try:
+            self._audit.append(
+                {
+                    "action": event,
+                    "app_id": self._app_id,
+                    "version": self._version,
+                    "result": "detected",
+                    "detail": detail,
+                }
+            )
+        except Exception:
+            pass

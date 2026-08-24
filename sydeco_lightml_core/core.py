@@ -28,20 +28,30 @@ from .registry import Registry, default_data_dir
 from .router import Router
 from .secrets import generate_token, write_token
 from .validation import validate_manifest
-from .worker import InProcessWorkerHost, WorkerManager
+from .worker import (
+    InProcessWorkerHost,
+    SystemdTransientWorkerHost,
+    WorkerManager,
+    allocate_port,
+)
 
 
 class CoreService:
     """Universal LightML Core facade (Day 1 scope)."""
 
-    def __init__(self, data_dir: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        data_dir: Optional[str] = None,
+        worker_mode: str = "inprocess",
+    ) -> None:
         self.data_dir = data_dir or default_data_dir()
+        self.worker_mode = worker_mode  # "inprocess" (dev/tests) | "systemd" (D1c)
         self.audit = JsonlAuditBackend(os.path.join(self.data_dir, "audit"))
         self.registry = Registry(self.data_dir, audit=self.audit)
         self.router = Router(self.registry)
         self.readiness = ReadinessStore()
         self.worker_manager = WorkerManager(readiness=self.readiness)
-        self._hosts: Dict[str, InProcessWorkerHost] = {}
+        self._hosts: Dict[str, Any] = {}
         self.audit.append({"action": "core_start", "app_id": "", "result": "ok"})
 
     def install_app(
@@ -220,6 +230,23 @@ class CoreService:
                             }
                         )
 
+        # D3a / L2 (2.9): dedicated capability OS user, provisioned at
+        # install time — NEVER during inference. systemd mode only
+        # (requires root; the Core serving process stays non-root).
+        try:
+            self._provision_capability_user(app_id)
+        except Exception as exc:
+            self.audit.append(
+                {
+                    "action": "install",
+                    "app_id": app_id,
+                    "result": "fail",
+                    "reason": "user provisioning failed",
+                    "detail": str(exc),
+                }
+            )
+            return False, f"install rejected: {exc}", None
+
         # Step 5: register (F1) + audit (emitted by registry)
         entry = self.registry.register(
             app_id=app_id,
@@ -240,6 +267,110 @@ class CoreService:
         return True, f"app registered: {app_id} v{version}", entry
 
     # ---- Day 2: worker hosting + serving -------------------------------
+
+    def _provision_capability_user(self, app_id: str) -> Optional[str]:
+        """D3a / L2 (2.9): create the dedicated capability OS user.
+
+        Provisioned at install time (proposal 3.1 step 6), NEVER during
+        inference; Core itself must not run permanently as root (locked
+        2026-08-24). systemd mode only — returns None in inprocess mode
+        (dev/tests). The app's data dir (R7a) is created and chowned to
+        the user so the worker can write only its own data dir.
+        """
+        if self.worker_mode != "systemd":
+            return None
+        import subprocess
+
+        user = f"sydeco-cap-{app_id}"
+        proc = subprocess.run(
+            ["useradd", "-r", "-M", "-s", "/usr/sbin/nologin", user],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0 and "already exists" not in (proc.stderr or ""):
+            raise RuntimeError(
+                f"cannot create OS user {user}: {(proc.stderr or proc.stdout).strip()}"
+            )
+        app_data_dir = os.path.join(self.data_dir, "apps", app_id, "data")
+        os.makedirs(app_data_dir, exist_ok=True)
+        subprocess.run(
+            ["chown", "-R", f"{user}:{user}", app_data_dir],
+            capture_output=True, text=True,
+        )
+        return user
+
+    def _start_app_systemd(
+        self,
+        app_id: str,
+        manifest: Dict[str, Any],
+        version: str,
+        app_root: str,
+    ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+        """D1c: start one app's worker as a systemd TRANSIENT unit.
+
+        Models load INSIDE the worker process (A1), the adapter lives in
+        the worker (3.0/R3); Core never imports application code in this
+        mode. Core assigns the loopback port (D2 req 1), launches the
+        unit with User=sydeco-cap-<id> (D3a) + cgroup/sandbox properties
+        from the manifest (A3/3.3), then polls /health/ready (G1).
+        """
+        app_data_dir = os.path.join(self.data_dir, "apps", app_id, "data")
+        # The data dir MUST exist BEFORE systemd-run: under
+        # ProtectSystem=strict, ReadWritePaths= is resolved during mount
+        # namespacing — a missing path fails the unit at NAMESPACE step
+        # (status 226/NAMESPACE). The dir is also chowned to the
+        # capability user (D3a/R7a) so the worker can write its own data.
+        os.makedirs(app_data_dir, exist_ok=True)
+        os.chmod(app_data_dir, 0o755)
+        if self.worker_mode == "systemd":
+            try:
+                import subprocess
+
+                subprocess.run(
+                    ["chown", "-R", f"sydeco-cap-{app_id}:sydeco-cap-{app_id}",
+                     app_data_dir],
+                    capture_output=True, text=True, timeout=30,
+                )
+            except Exception:
+                pass
+        repo_root = os.environ.get(
+            "SYDECO_LIGHTML_WORKER_REPO",
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        )
+        context: Dict[str, Any] = {
+            "app_root": app_root,
+            "config": manifest,
+            "data_dir": app_data_dir,
+            "port": allocate_port(),            # D2 req 1: Core assigns
+            "user": f"sydeco-cap-{app_id}",     # D3a
+            "python": sys.executable,
+            "cwd": repo_root,
+            "pythonpath": repo_root,
+        }
+        host = self._hosts.get(app_id)
+        if host is None:
+            host = SystemdTransientWorkerHost(
+                readiness=self.readiness, audit=self.audit
+            )
+            self._hosts[app_id] = host
+            self.worker_manager.register_host(app_id, host)
+        else:
+            self.worker_manager.stop(app_id)
+        try:
+            self.worker_manager.start(app_id, version, None, context)
+        except Exception as exc:
+            self.readiness.set(app_id, AppStatus.BACKOFF, detail="worker start failed")
+            self.audit.append(
+                {"action": "worker_start", "app_id": app_id, "version": version,
+                 "result": "fail", "reason": str(exc)}
+            )
+            return False, f"start failed: {exc}", None
+        self.audit.append(
+            {"action": "worker_start", "app_id": app_id, "version": version,
+             "result": "ok"}
+        )
+        return True, f"app started: {app_id} v{version}", {
+            "app_id": app_id, "status": "ready", "active_version": version,
+        }
 
     def _load_adapter(self, manifest: Dict[str, Any], app_root: str) -> Any:
         """Dynamically import the application's adapter (R3).
@@ -274,6 +405,11 @@ class CoreService:
         manifest = info["manifest"]
         version = info["active_version"]
         app_root = info["filesystem_paths"]["app_root"]
+
+        if self.worker_mode == "systemd":
+            # D1c: worker as a systemd transient unit — models load INSIDE
+            # the worker (A1), adapter lives in the worker (3.0/R3).
+            return self._start_app_systemd(app_id, manifest, version, app_root)
 
         try:
             models = load_artifacts(manifest, app_root)  # E5 at every start
@@ -347,7 +483,7 @@ class CoreService:
         host.simulate_crash()
         return True, f"app crashed (simulated): {app_id}", None
 
-    def worker_host(self, app_id: str) -> Optional[InProcessWorkerHost]:
+    def worker_host(self, app_id: str) -> Optional[Any]:
         return self._hosts.get(app_id)
 
     def health_apps(self) -> Dict[str, Dict[str, Any]]:

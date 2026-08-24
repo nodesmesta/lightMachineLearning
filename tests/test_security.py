@@ -305,6 +305,77 @@ class SecurityTests(unittest.TestCase):
         self.assertIn("escapes app dir", message2.lower())
         self.assertIsNone(entry2)
 
+    # 13. worker binds loopback ONLY (P6 / D2 req 3, 2026-08-24)
+    def test_13_worker_binds_loopback_only(self) -> None:
+        """The worker runtime must never listen on 0.0.0.0 / :: / an
+        external interface (L3). The bind host is hard-coded to
+        127.0.0.1; this test spawns the real worker_runtime process and
+        inspects /proc/net/tcp for the listener address."""
+        import http.client
+        import socket
+        import subprocess
+        import sys
+        import time
+
+        from sydeco_lightml_core.worker_runtime import WORKER_BIND_HOST
+
+        self.assertEqual(WORKER_BIND_HOST, "127.0.0.1")
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        app_root = os.path.join(repo, "examples", "text-classifier")
+        env = dict(
+            os.environ,
+            PYTHONPYCACHEPREFIX=tempfile.mkdtemp(prefix="sydeco-sec-pycache-"),
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "sydeco_lightml_core.worker_runtime",
+             "--app-root", app_root, "--port", str(port)],
+            cwd=repo, env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.time() + 20
+            ready = False
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    break
+                try:
+                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=1)
+                    conn.request("GET", "/health/ready")
+                    resp = conn.getresponse()
+                    resp.read()
+                    conn.close()
+                    if resp.status == 200:
+                        ready = True
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.2)
+            self.assertTrue(ready, "worker did not become ready")
+            with open("/proc/net/tcp", "r", encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+            hexport = f"{port:04X}"
+            listeners = [ln for ln in lines if hexport in ln and " 0A " in ln]
+            self.assertTrue(listeners, f"no listener found for port {port}")
+            for ln in listeners:
+                local = ln.split()[1].split(":")[0]
+                self.assertEqual(
+                    local, "0100007F",
+                    f"worker listener is NOT loopback: 0x{local} (port {port})",
+                )
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+
 
 if __name__ == "__main__":
     unittest.main()
