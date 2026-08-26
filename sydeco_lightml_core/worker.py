@@ -121,6 +121,7 @@ class InProcessWorkerHost(WorkerHost):
         self._context: Dict[str, Any] = {}
         self._timeout = 120.0
         self._broken = False
+        self._recycling = False
         self._readiness = readiness
         self._audit = audit
         self._executor = ThreadPoolExecutor(
@@ -152,9 +153,83 @@ class InProcessWorkerHost(WorkerHost):
         try:
             return future.result(timeout=self._timeout)
         except concurrent.futures.TimeoutError:
+            self._on_timeout()
             raise InferenceTimeout(
                 f"inference timeout after {self._timeout:.0f}s: {self._app_id}"
             )
+
+    def _on_timeout(self) -> None:
+        """Day 1B (2026-08-26): dev-host mirror of the reviewer's preferred
+        behaviour — 504 -> worker not-ready -> discard the stuck adapter
+        execution -> re-initialize in the background (readiness false until
+        the replacement worker is ready).
+
+        A stuck inference thread cannot be killed; the old executor is
+        discarded (shutdown wait=False) and a FRESH single-flight executor
+        takes over, so subsequent inferences are served by a clean worker.
+        The abandoned thread is a daemon and cannot block process exit.
+        """
+        import threading
+
+        if self._recycling:
+            return
+        self._recycling = True
+        if self._audit is not None:
+            self._audit.append(
+                {
+                    "action": "INFERENCE_TIMEOUT",
+                    "app_id": self._app_id,
+                    "version": self._version,
+                    "result": "detected",
+                    "detail": f"no response within {self._timeout:.0f}s",
+                }
+            )
+        self._broken = True
+        if self._readiness is not None:
+            self._readiness.set(
+                self._app_id, AppStatus.BACKOFF, detail="timeout recycle"
+            )
+        self._executor.shutdown(wait=False)
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="sydeco-worker"
+        )
+        threading.Thread(
+            target=self._recycle_worker, daemon=True,
+            name=f"sydeco-recycle-{self._app_id}",
+        ).start()
+
+    def _recycle_worker(self) -> None:
+        try:
+            self.restart(self._app_id)
+            if self._audit is not None:
+                self._audit.append(
+                    {
+                        "action": "WORKER_RESTART",
+                        "app_id": self._app_id,
+                        "version": self._version,
+                        "result": "detected",
+                        "detail": "timeout recycle",
+                    }
+                )
+            # READY is set LAST so that an observer of the readiness store
+            # can rely on the WORKER_RESTART audit entry already being
+            # written (deterministic tests / acceptance evidence).
+            if self._readiness is not None:
+                self._readiness.set(self._app_id, AppStatus.READY)
+        except Exception:
+            # Readiness stays BACKOFF; the app stays gated (503).
+            if self._audit is not None:
+                self._audit.append(
+                    {
+                        "action": "WORKER_CRASH",
+                        "app_id": self._app_id,
+                        "version": self._version,
+                        "result": "detected",
+                        "detail": "timeout recycle failed",
+                    }
+                )
+        finally:
+            self._recycling = False
 
     def stop(self, app_id: str) -> None:
         adapter = self._adapter
@@ -167,8 +242,13 @@ class InProcessWorkerHost(WorkerHost):
     def restart(self, app_id: str) -> None:
         if self._adapter is None or not self._context:
             raise RuntimeError(f"cannot restart {app_id}: never started")
-        self._broken = False
-        self._adapter.initialize(self._context)
+        # Not ready while re-initializing (Day 1B: a restarting worker must
+        # not serve inference — same rule the readiness store enforces).
+        self._broken = True
+        try:
+            self._adapter.initialize(self._context)
+        finally:
+            self._broken = False
 
     def status(self, app_id: str) -> str:
         if self._broken:
@@ -271,6 +351,8 @@ class SystemdTransientWorkerHost(WorkerHost):
         self._last_nrestarts = 0
         self._last_throttled = 0
         self._pids_flagged = False
+        self._recycling = False
+        self._launch_count = 0
 
     # ---- lifecycle -----------------------------------------------------
 
@@ -301,7 +383,16 @@ class SystemdTransientWorkerHost(WorkerHost):
         data_dir = context.get("data_dir")
         cwd = context.get("cwd", "")
         pythonpath = context.get("pythonpath", "")
-        unit = f"{self._unit_prefix}-{app_id}"
+        # Unique unit name per launch: launch #1 keeps the canonical
+        # sydeco-cap-<app_id> (Day-1 evidence format); every RELAUNCH (e.g.
+        # the Day-1B timeout recycle) gets a fresh name -r1, -r2, ... so
+        # systemd-run never collides with an existing transient unit and
+        # each run has its own clean journal/cgroup (24-08 pitfall).
+        if self._launch_count == 0:
+            unit = f"{self._unit_prefix}-{app_id}"
+        else:
+            unit = f"{self._unit_prefix}-{app_id}-r{self._launch_count}"
+        self._launch_count += 1
         self._unit = unit
         self._last_context = dict(context)
 
@@ -442,6 +533,7 @@ class SystemdTransientWorkerHost(WorkerHost):
         if not self._started or not self._ready:
             raise WorkerNotReady(f"worker not ready: {self._app_id}")
         body = json.dumps(request).encode("utf-8")
+        conn = None
         try:
             conn = http.client.HTTPConnection(
                 "127.0.0.1", self._port, timeout=self._timeout
@@ -454,10 +546,22 @@ class SystemdTransientWorkerHost(WorkerHost):
             data = resp.read()
             conn.close()
         except socket.timeout:
+            # close the half-open connection (the client-side timeout does
+            # not reach conn.close() below) — no resource leak per timeout
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
             self._audit_event(
                 "INFERENCE_TIMEOUT",
                 detail=f"no response within {self._timeout:.0f}s",
             )
+            # Day 1B (2026-08-26): 504 alone is not containment — the stuck
+            # adapter must not keep occupying the single-flight worker.
+            # Recycle the capability worker via the existing A3 restart
+            # path; readiness is false until the replacement is ready.
+            self._recycle_after_timeout()
             raise InferenceTimeout(
                 f"inference timeout after {self._timeout:.0f}s: {self._app_id}"
             )
@@ -472,6 +576,48 @@ class SystemdTransientWorkerHost(WorkerHost):
                 f"worker error {resp.status}: {obj.get('error', obj)}"
             )
         return obj["result"]
+
+    # ---- timeout recycle (Day 1B, 2026-08-26) --------------------------
+
+    def _recycle_after_timeout(self) -> None:
+        """504 -> readiness false -> recycle the worker in the background.
+
+        The 504 is returned promptly (the recycle runs on a daemon thread);
+        the readiness store shows BACKOFF until the replacement worker is
+        READY again — the reviewer's preferred behaviour, verbatim:
+        "Inference timeout -> return 504 -> terminate/recycle that
+        capability worker -> restart cleanly -> readiness false until the
+        replacement worker is ready."
+        """
+        import threading
+
+        if self._recycling:
+            return
+        self._recycling = True
+        self._ready = False
+        if self._readiness is not None:
+            self._readiness.set(
+                self._app_id, AppStatus.BACKOFF, detail="timeout recycle"
+            )
+        threading.Thread(
+            target=self._recycle_worker, daemon=True,
+            name=f"sydeco-recycle-{self._app_id}",
+        ).start()
+
+    def _recycle_worker(self) -> None:
+        """Background: stop + relaunch the transient unit (existing A3
+        restart path), re-poll /health/ready, then mark READY."""
+        try:
+            self.restart(self._app_id)
+            self._audit_event("WORKER_RESTART", detail="timeout recycle")
+            # READY last (see InProcessWorkerHost._recycle_worker).
+            if self._readiness is not None:
+                self._readiness.set(self._app_id, AppStatus.READY)
+        except Exception:
+            # Readiness stays BACKOFF; the monitor audits the failure.
+            self._audit_event("WORKER_CRASH", detail="timeout recycle failed")
+        finally:
+            self._recycling = False
 
     # ---- readiness polling (G1) ----------------------------------------
 
