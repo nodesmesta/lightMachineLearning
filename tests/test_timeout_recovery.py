@@ -41,6 +41,7 @@ from sydeco_lightml_core.worker import (
     InferenceTimeout,
     InProcessWorkerHost,
     SystemdTransientWorkerHost,
+    WorkerManager,
     WorkerNotReady,
 )
 
@@ -75,6 +76,97 @@ class _StallAdapter(Adapter):
 
     def shutdown(self) -> None:
         pass
+
+
+class _ZombieAdapter(Adapter):
+    """Generation 1 blocks until explicitly released; later generations work."""
+
+    def __init__(
+        self,
+        number: int,
+        first_started: threading.Event,
+        release_first: threading.Event,
+        replacement_init_started: threading.Event,
+        allow_replacement_init: threading.Event,
+        shutdown_called: threading.Event | None = None,
+    ) -> None:
+        self.number = number
+        self.invocations = 0
+        self._first_started = first_started
+        self._release_first = release_first
+        self._replacement_init_started = replacement_init_started
+        self._allow_replacement_init = allow_replacement_init
+        self._shutdown_called = shutdown_called
+
+    def initialize(self, context) -> None:
+        if self.number > 1:
+            self._replacement_init_started.set()
+            self._allow_replacement_init.wait(timeout=5)
+
+    def infer(self, request, context):
+        self.invocations += 1
+        if self.number == 1:
+            self._first_started.set()
+            self._release_first.wait()
+            return {"label": "late-a1"}
+        return {"label": f"active-a{self.number}"}
+
+    def shutdown(self) -> None:
+        if self._shutdown_called is not None:
+            self._shutdown_called.set()
+
+
+class _LateCompletionAdapter(Adapter):
+    """Deterministically completes or fails after its generation is stopped."""
+
+    def __init__(self, started: threading.Event, release: threading.Event, fail=False):
+        self._started = started
+        self._release = release
+        self._fail = fail
+
+    def initialize(self, context) -> None:
+        pass
+
+    def infer(self, request, context):
+        self._started.set()
+        self._release.wait(timeout=5)
+        if self._fail:
+            raise RuntimeError("late old-generation error")
+        return {"label": "late-old-generation"}
+
+    def shutdown(self) -> None:
+        pass
+
+
+class _BlockingLifecycleAdapter(Adapter):
+    """Blocks selected external lifecycle callbacks for lock-boundary tests."""
+
+    def __init__(
+        self,
+        init_started: threading.Event | None = None,
+        release_init: threading.Event | None = None,
+        shutdown_started: threading.Event | None = None,
+        release_shutdown: threading.Event | None = None,
+    ) -> None:
+        self._init_started = init_started
+        self._release_init = release_init
+        self._shutdown_started = shutdown_started
+        self._release_shutdown = release_shutdown
+
+    def initialize(self, context) -> None:
+        if self._init_started is not None:
+            self._init_started.set()
+        if self._release_init is not None:
+            self._release_init.wait(timeout=5)
+
+    def infer(self, request, context):
+        return {"label": "ok"}
+
+    def shutdown(self) -> None:
+        if self._shutdown_started is not None:
+            self._shutdown_started.set()
+        if self._release_shutdown is not None:
+            self._release_shutdown.wait(timeout=5)
 
 
 STALL_ADAPTER_SRC = """\
@@ -453,7 +545,7 @@ class TimeoutRecoveryTests(unittest.TestCase):
         host.start(
             "app-x",
             "1.0.0",
-            _StallAdapter(init_sleep=0.8, stall_sleep=2.0),
+            lambda: _StallAdapter(init_sleep=0.8, stall_sleep=2.0),
             {
                 "config": {"resource_limits": {"inference_timeout": 0.4}},
                 "data_dir": os.path.join(self._tmp, "data3"),
@@ -464,9 +556,8 @@ class TimeoutRecoveryTests(unittest.TestCase):
         with self.assertRaises(InferenceTimeout):
             host.infer({"text": "STALL"}, "r1")
 
-        # readiness false (BACKOFF, synchronous) until the replacement ready
-        # (the readiness STORE is the authoritative gate; host.status() may
-        # flip early because restart() clears _broken at its start)
+        # Readiness stays false (BACKOFF, synchronous) until the fresh
+        # adapter generation finishes initialization.
         self.assertEqual(readiness.status("app-x"), "backoff")
         with self.assertRaises(WorkerNotReady):
             host.infer({"text": "x"}, "r-busy")
@@ -491,6 +582,326 @@ class TimeoutRecoveryTests(unittest.TestCase):
             "WORKER_RESTART (timeout recycle) must be audited",
         )
 
+    def test_04_inprocess_quarantines_zombie_adapter_generation(self) -> None:
+        """A timed-out generation can never influence the replacement."""
+        audit_dir = os.path.join(self._tmp, "audit4")
+        audit = JsonlAuditBackend(audit_dir)
+        readiness = ReadinessStore()
+        first_started = threading.Event()
+        release_first = threading.Event()
+        replacement_init_started = threading.Event()
+        allow_replacement_init = threading.Event()
+        instances = []
+
+        def adapter_factory():
+            adapter = _ZombieAdapter(
+                len(instances) + 1,
+                first_started,
+                release_first,
+                replacement_init_started,
+                allow_replacement_init,
+            )
+            instances.append(adapter)
+            return adapter
+
+        host = InProcessWorkerHost(readiness=readiness, audit=audit)
+        self.addCleanup(release_first.set)
+        self.addCleanup(allow_replacement_init.set)
+        self.addCleanup(host.shutdown)
+        host.start(
+            "app-zombie",
+            "1.0.0",
+            adapter_factory,
+            {
+                "config": {"resource_limits": {"inference_timeout": 0.1}},
+                "data_dir": os.path.join(self._tmp, "data4"),
+            },
+        )
+
+        with self.assertRaises(InferenceTimeout):
+            host.infer({"text": "BLOCK"}, "r-zombie")
+        self.assertTrue(first_started.is_set())
+        self.assertEqual(readiness.status("app-zombie"), "backoff")
+
+        self.assertTrue(replacement_init_started.wait(timeout=2))
+        self.assertEqual(len(instances), 2)
+        self.assertIsNot(instances[0], instances[1])
+        self.assertEqual(instances[0].invocations, 1)
+        self.assertFalse(readiness.is_ready("app-zombie"))
+
+        allow_replacement_init.set()
+        deadline = time.time() + 3
+        while time.time() < deadline and not readiness.is_ready("app-zombie"):
+            time.sleep(0.02)
+        self.assertTrue(readiness.is_ready("app-zombie"))
+        self.assertEqual(
+            host.infer({"text": "normal"}, "r-active"),
+            {"label": "active-a2"},
+        )
+        self.assertEqual(instances[0].invocations, 1)
+
+        before_release = self._read_audit(audit_dir)
+        restart_before = [e for e in before_release if e.get("action") == "WORKER_RESTART"]
+        self.assertEqual(len(restart_before), 1)
+
+        release_first.set()
+        time.sleep(0.1)
+        self.assertIs(host._adapter, instances[1])
+        self.assertTrue(readiness.is_ready("app-zombie"))
+        self.assertEqual(instances[0].invocations, 1)
+        after_release = self._read_audit(audit_dir)
+        restart_after = [e for e in after_release if e.get("action") == "WORKER_RESTART"]
+        self.assertEqual(len(restart_after), 1)
+
+    def test_05_quarantine_cancels_queued_old_generation_work(self) -> None:
+        """Queued work must not run on A1 after its generation is abandoned."""
+        readiness = ReadinessStore()
+        first_started = threading.Event()
+        release_first = threading.Event()
+        replacement_init_started = threading.Event()
+        allow_replacement_init = threading.Event()
+        instances = []
+        results = []
+
+        def adapter_factory():
+            adapter = _ZombieAdapter(
+                len(instances) + 1,
+                first_started,
+                release_first,
+                replacement_init_started,
+                allow_replacement_init,
+            )
+            instances.append(adapter)
+            return adapter
+
+        host = InProcessWorkerHost(readiness=readiness)
+        self.addCleanup(release_first.set)
+        self.addCleanup(allow_replacement_init.set)
+        self.addCleanup(host.shutdown)
+        host.start(
+            "app-queued",
+            "1.0.0",
+            adapter_factory,
+            {"config": {"resource_limits": {"inference_timeout": 0.15}}},
+        )
+
+        def invoke(request_id):
+            try:
+                host.infer({"text": "BLOCK"}, request_id)
+                results.append("returned")
+            except (
+                InferenceTimeout,
+                WorkerNotReady,
+                concurrent.futures.CancelledError,
+            ) as exc:
+                results.append(type(exc).__name__)
+
+        import concurrent.futures
+
+        first = threading.Thread(target=invoke, args=("r-first",))
+        second = threading.Thread(target=invoke, args=("r-queued",))
+        first.start()
+        self.assertTrue(first_started.wait(timeout=1))
+        second.start()
+        first.join(timeout=2)
+        second.join(timeout=2)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertTrue(replacement_init_started.wait(timeout=2))
+        self.assertEqual(instances[0].invocations, 1)
+
+        allow_replacement_init.set()
+        deadline = time.time() + 2
+        while time.time() < deadline and not readiness.is_ready("app-queued"):
+            time.sleep(0.02)
+        self.assertTrue(readiness.is_ready("app-queued"))
+        release_first.set()
+        time.sleep(0.1)
+        self.assertEqual(instances[0].invocations, 1)
+        self.assertEqual(len(results), 2)
+
+    def test_06_stop_invalidates_inflight_recycle(self) -> None:
+        """A replacement finishing after stop must not resurrect the app."""
+        audit_dir = os.path.join(self._tmp, "audit6")
+        audit = JsonlAuditBackend(audit_dir)
+        readiness = ReadinessStore()
+        manager = WorkerManager(readiness)
+        first_started = threading.Event()
+        release_first = threading.Event()
+        replacement_init_started = threading.Event()
+        allow_replacement_init = threading.Event()
+        instances = []
+        shutdown_events = []
+
+        def adapter_factory():
+            shutdown_called = threading.Event()
+            adapter = _ZombieAdapter(
+                len(instances) + 1,
+                first_started,
+                release_first,
+                replacement_init_started,
+                allow_replacement_init,
+                shutdown_called,
+            )
+            instances.append(adapter)
+            shutdown_events.append(shutdown_called)
+            return adapter
+
+        host = InProcessWorkerHost(readiness=readiness, audit=audit)
+        manager.register_host("app-stop", host)
+        self.addCleanup(release_first.set)
+        self.addCleanup(allow_replacement_init.set)
+        self.addCleanup(host.shutdown)
+        manager.start(
+            "app-stop",
+            "1.0.0",
+            adapter_factory,
+            {"config": {"resource_limits": {"inference_timeout": 0.1}}},
+        )
+
+        with self.assertRaises(InferenceTimeout):
+            host.infer({"text": "BLOCK"}, "r-stop")
+        self.assertTrue(replacement_init_started.wait(timeout=2))
+        manager.stop("app-stop")
+        self.assertEqual(readiness.status("app-stop"), "idle")
+
+        allow_replacement_init.set()
+        self.assertTrue(shutdown_events[1].wait(timeout=2))
+        self.assertEqual(readiness.status("app-stop"), "idle")
+        self.assertEqual(host.status("app-stop"), "idle")
+        entries = self._read_audit(audit_dir)
+        restart_entries = [e for e in entries if e.get("action") == "WORKER_RESTART"]
+        self.assertEqual(restart_entries, [])
+
+    def _assert_stale_completion_is_ignored(self, fail: bool) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        host = InProcessWorkerHost()
+        host.start(
+            "app-late",
+            "1.0.0",
+            lambda: _LateCompletionAdapter(started, release, fail=fail),
+            {"config": {"resource_limits": {"inference_timeout": 2.0}}},
+        )
+        outcome = []
+
+        def invoke():
+            try:
+                outcome.append(("result", host.infer({}, "r-late")))
+            except Exception as exc:
+                outcome.append(("error", type(exc).__name__))
+
+        caller = threading.Thread(target=invoke)
+        caller.start()
+        self.assertTrue(started.wait(timeout=1))
+        host.stop("app-late")
+        release.set()
+        caller.join(timeout=2)
+        self.assertFalse(caller.is_alive())
+        self.assertEqual(outcome, [("error", "WorkerNotReady")])
+        self.assertEqual(host.status("app-late"), "idle")
+        host.shutdown()
+
+    def test_07_stale_success_after_stop_is_ignored(self) -> None:
+        """A successful result from an abandoned key must not reach its caller."""
+        self._assert_stale_completion_is_ignored(fail=False)
+
+    def test_08_stale_exception_after_stop_is_ignored(self) -> None:
+        """An exception from an abandoned key must not reach its caller."""
+        self._assert_stale_completion_is_ignored(fail=True)
+
+    def test_09_start_initialize_does_not_hold_lifecycle_lock(self) -> None:
+        """External initialize may block without blocking lifecycle inspection."""
+        init_started = threading.Event()
+        release_init = threading.Event()
+        host = InProcessWorkerHost()
+        self.addCleanup(release_init.set)
+        self.addCleanup(host.shutdown)
+        starter = threading.Thread(
+            target=host.start,
+            args=(
+                "app-init",
+                "1.0.0",
+                lambda: _BlockingLifecycleAdapter(init_started, release_init),
+                {},
+            ),
+        )
+        starter.start()
+        self.assertTrue(init_started.wait(timeout=1))
+        status_result = []
+        inspector = threading.Thread(target=lambda: status_result.append(host.status("app-init")))
+        inspector.start()
+        inspector.join(timeout=0.3)
+        self.assertFalse(inspector.is_alive(), "initialize() held the lifecycle lock")
+        self.assertEqual(status_result, ["backoff"])
+        release_init.set()
+        starter.join(timeout=2)
+        self.assertFalse(starter.is_alive())
+
+    def test_10_stop_shutdown_does_not_hold_lifecycle_lock(self) -> None:
+        """External shutdown may block without blocking IDLE publication."""
+        shutdown_started = threading.Event()
+        release_shutdown = threading.Event()
+        host = InProcessWorkerHost()
+        self.addCleanup(release_shutdown.set)
+        self.addCleanup(host.shutdown)
+        host.start(
+            "app-shutdown",
+            "1.0.0",
+            _BlockingLifecycleAdapter(
+                shutdown_started=shutdown_started,
+                release_shutdown=release_shutdown,
+            ),
+            {},
+        )
+        stopper = threading.Thread(target=host.stop, args=("app-shutdown",))
+        stopper.start()
+        self.assertTrue(shutdown_started.wait(timeout=1))
+        status_result = []
+        inspector = threading.Thread(
+            target=lambda: status_result.append(host.status("app-shutdown"))
+        )
+        inspector.start()
+        inspector.join(timeout=0.3)
+        self.assertFalse(inspector.is_alive(), "shutdown() held the lifecycle lock")
+        self.assertEqual(status_result, ["idle"])
+        release_shutdown.set()
+        stopper.join(timeout=2)
+        self.assertFalse(stopper.is_alive())
+
+    def test_11_restart_initialize_does_not_hold_lifecycle_lock(self) -> None:
+        """Replacement initialize may block while status remains observable."""
+        init_started = threading.Event()
+        release_init = threading.Event()
+        instances = []
+
+        def factory():
+            adapter = (
+                _BlockingLifecycleAdapter()
+                if not instances
+                else _BlockingLifecycleAdapter(init_started, release_init)
+            )
+            instances.append(adapter)
+            return adapter
+
+        host = InProcessWorkerHost()
+        self.addCleanup(release_init.set)
+        self.addCleanup(host.shutdown)
+        host.start("app-restart", "1.0.0", factory, {"config": {}})
+        restarter = threading.Thread(target=host.restart, args=("app-restart",))
+        restarter.start()
+        self.assertTrue(init_started.wait(timeout=1))
+        status_result = []
+        inspector = threading.Thread(
+            target=lambda: status_result.append(host.status("app-restart"))
+        )
+        inspector.start()
+        inspector.join(timeout=0.3)
+        self.assertFalse(inspector.is_alive(), "restart initialize held lifecycle lock")
+        self.assertEqual(status_result, ["backoff"])
+        release_init.set()
+        restarter.join(timeout=2)
+        self.assertFalse(restarter.is_alive())
 
 if __name__ == "__main__":
     unittest.main()

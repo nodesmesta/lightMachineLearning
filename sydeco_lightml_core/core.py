@@ -421,15 +421,8 @@ class CoreService:
             )
             return False, f"start rejected: {exc}", None
 
-        try:
-            adapter = self._load_adapter(manifest, app_root)
-        except Exception as exc:
-            self.readiness.set(app_id, AppStatus.BACKOFF, detail="adapter load failed")
-            self.audit.append(
-                {"action": "worker_start", "app_id": app_id, "version": version,
-                 "result": "fail", "reason": str(exc)}
-            )
-            return False, f"start rejected: {exc}", None
+        def adapter_factory():
+            return self._load_adapter(manifest, app_root)
 
         # R7a: app's own writable data dir (outside the versioned layout)
         app_data_dir = os.path.join(self.data_dir, "apps", app_id, "data")
@@ -451,7 +444,7 @@ class CoreService:
             self.worker_manager.stop(app_id)  # clean previous lifecycle
 
         try:
-            self.worker_manager.start(app_id, version, adapter, context)
+            self.worker_manager.start(app_id, version, adapter_factory, context)
         except Exception as exc:
             self.readiness.set(app_id, AppStatus.BACKOFF, detail="worker start failed")
             self.audit.append(

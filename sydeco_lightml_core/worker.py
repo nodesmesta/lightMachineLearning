@@ -16,8 +16,9 @@ import abc
 import concurrent.futures
 import json
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Union
 
 from .adapter import Adapter
 from .health import AppStatus, ReadinessStore
@@ -27,7 +28,13 @@ class WorkerHost(abc.ABC):
     """Abstract worker host: start / stop / restart one capability worker."""
 
     @abc.abstractmethod
-    def start(self, app_id: str, version: str, adapter: Optional[Adapter], context: Dict[str, Any]) -> None:
+    def start(
+        self,
+        app_id: str,
+        version: str,
+        adapter: Optional[Union[Adapter, Callable[[], Adapter]]],
+        context: Dict[str, Any],
+    ) -> None:
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -57,7 +64,13 @@ class WorkerManager:
     def register_host(self, app_id: str, host: WorkerHost) -> None:
         self._workers[app_id] = host
 
-    def start(self, app_id: str, version: str, adapter: Adapter, context: Dict[str, Any]) -> None:
+    def start(
+        self,
+        app_id: str,
+        version: str,
+        adapter: Optional[Union[Adapter, Callable[[], Adapter]]],
+        context: Dict[str, Any],
+    ) -> None:
         if app_id not in self._workers:
             raise KeyError(f"no worker host registered for {app_id}")
         self.readiness.set(app_id, AppStatus.LOADING)
@@ -118,10 +131,14 @@ class InProcessWorkerHost(WorkerHost):
         self._app_id = ""
         self._version = ""
         self._adapter: Optional[Adapter] = None
+        self._adapter_factory: Optional[Callable[[], Adapter]] = None
         self._context: Dict[str, Any] = {}
         self._timeout = 120.0
         self._broken = False
-        self._recycling = False
+        self._stopped = True
+        self._recycling_generation: Optional[int] = None
+        self._generation = 0
+        self._lifecycle_lock = threading.RLock()
         self._readiness = readiness
         self._audit = audit
         self._executor = ThreadPoolExecutor(
@@ -129,110 +146,212 @@ class InProcessWorkerHost(WorkerHost):
         )
 
     def start(
-        self, app_id: str, version: str, adapter: Optional[Adapter], context: Dict[str, Any]
+        self,
+        app_id: str,
+        version: str,
+        adapter: Optional[Union[Adapter, Callable[[], Adapter]]],
+        context: Dict[str, Any],
     ) -> None:
         assert adapter is not None, "InProcessWorkerHost requires an adapter"
-        self._app_id = app_id
-        self._version = version
-        self._adapter = adapter
-        self._context = dict(context)
-        rl = context.get("config", {}).get("resource_limits", {})
-        try:
-            self._timeout = float(rl.get("inference_timeout", 120))
-        except (TypeError, ValueError):
-            self._timeout = 120.0
-        self._broken = False
-        adapter.initialize(context)
+        candidate: Optional[Adapter]
+        with self._lifecycle_lock:
+            self._app_id = app_id
+            self._version = version
+            if callable(adapter) and not isinstance(adapter, Adapter):
+                self._adapter_factory = adapter
+                candidate = None
+            else:
+                self._adapter_factory = None
+                candidate = adapter
+            self._context = dict(context)
+            rl = context.get("config", {}).get("resource_limits", {})
+            try:
+                self._timeout = float(rl.get("inference_timeout", 120))
+            except (TypeError, ValueError):
+                self._timeout = 120.0
+            self._generation += 1
+            generation = self._generation
+            self._recycling_generation = None
+            self._broken = True
+            self._stopped = False
+            factory = self._adapter_factory
+
+        if candidate is None:
+            assert factory is not None
+            candidate = factory()
+        candidate.initialize(context)
+
+        with self._lifecycle_lock:
+            stale = self._stopped or generation != self._generation
+            if not stale:
+                self._adapter = candidate
+                self._broken = False
+        if stale:
+            try:
+                candidate.shutdown()
+            except Exception:
+                pass
+            raise WorkerNotReady(f"start generation superseded: {app_id}")
 
     def infer(self, request: Dict[str, Any], request_id: str) -> Any:
-        if self._broken or self._adapter is None:
-            raise WorkerNotReady(f"worker not ready: {self._app_id}")
-        context = dict(self._context)
-        context["request_id"] = request_id
-        future = self._executor.submit(self._adapter.infer, request, context)
+        with self._lifecycle_lock:
+            if self._broken or self._stopped or self._adapter is None:
+                raise WorkerNotReady(f"worker not ready: {self._app_id}")
+            context = dict(self._context)
+            context["request_id"] = request_id
+            generation = self._generation
+            adapter = self._adapter
+            future = self._executor.submit(adapter.infer, request, context)
         try:
-            return future.result(timeout=self._timeout)
+            result = future.result(timeout=self._timeout)
+        except concurrent.futures.CancelledError as exc:
+            raise WorkerNotReady(
+                f"worker generation quarantined: {self._app_id}"
+            ) from exc
         except concurrent.futures.TimeoutError:
-            self._on_timeout()
+            self._on_timeout(generation)
             raise InferenceTimeout(
                 f"inference timeout after {self._timeout:.0f}s: {self._app_id}"
             )
+        except Exception as exc:
+            with self._lifecycle_lock:
+                if self._stopped or generation != self._generation:
+                    raise WorkerNotReady(
+                        f"stale worker generation ignored: {self._app_id}"
+                    ) from exc
+            raise
+        with self._lifecycle_lock:
+            if self._stopped or generation != self._generation:
+                raise WorkerNotReady(
+                    f"stale worker generation ignored: {self._app_id}"
+                )
+        return result
 
-    def _on_timeout(self) -> None:
-        """Day 1B (2026-08-26): dev-host mirror of the reviewer's preferred
-        behaviour — 504 -> worker not-ready -> discard the stuck adapter
-        execution -> re-initialize in the background (readiness false until
-        the replacement worker is ready).
+    def _on_timeout(self, generation: int) -> None:
+        """Quarantine a timed-out dev-host generation and recover in BACKOFF.
 
-        A stuck inference thread cannot be killed; the old executor is
-        discarded (shutdown wait=False) and a FRESH single-flight executor
-        takes over, so subsequent inferences are served by a clean worker.
-        The abandoned thread is a daemon and cannot block process exit.
+        ``InProcessWorkerHost`` is a test-only approximation. Python cannot
+        safely terminate a running ThreadPoolExecutor inference, and
+        ``shutdown(wait=False)`` only abandons that executor. Hard containment
+        exists only in the production systemd host, which kills the worker
+        process. Recovery therefore requires an adapter factory: all future
+        work moves to a fresh adapter + executor generation, while completion
+        of the abandoned generation is ignored.
         """
-        import threading
-
-        if self._recycling:
-            return
-        self._recycling = True
-        if self._audit is not None:
-            self._audit.append(
-                {
-                    "action": "INFERENCE_TIMEOUT",
-                    "app_id": self._app_id,
-                    "version": self._version,
-                    "result": "detected",
-                    "detail": f"no response within {self._timeout:.0f}s",
-                }
+        with self._lifecycle_lock:
+            if (
+                self._stopped
+                or generation != self._generation
+                or self._recycling_generation is not None
+            ):
+                return
+            self._generation += 1
+            replacement_generation = self._generation
+            self._recycling_generation = replacement_generation
+            if self._audit is not None:
+                self._audit.append(
+                    {
+                        "action": "INFERENCE_TIMEOUT",
+                        "app_id": self._app_id,
+                        "version": self._version,
+                        "result": "detected",
+                        "detail": f"no response within {self._timeout:.0f}s",
+                    }
+                )
+            self._broken = True
+            if self._readiness is not None:
+                self._readiness.set(
+                    self._app_id, AppStatus.BACKOFF, detail="timeout recycle"
+                )
+            abandoned_executor = self._executor
+            self._executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="sydeco-worker"
             )
-        self._broken = True
-        if self._readiness is not None:
-            self._readiness.set(
-                self._app_id, AppStatus.BACKOFF, detail="timeout recycle"
-            )
-        self._executor.shutdown(wait=False)
-        self._executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="sydeco-worker"
-        )
+            abandoned_executor.shutdown(wait=False, cancel_futures=True)
         threading.Thread(
-            target=self._recycle_worker, daemon=True,
+            target=self._recycle_worker,
+            args=(replacement_generation,),
+            daemon=True,
             name=f"sydeco-recycle-{self._app_id}",
         ).start()
 
-    def _recycle_worker(self) -> None:
+    def _recycle_worker(self, generation: int) -> None:
+        replacement: Optional[Adapter] = None
         try:
-            self.restart(self._app_id)
-            if self._audit is not None:
-                self._audit.append(
-                    {
-                        "action": "WORKER_RESTART",
-                        "app_id": self._app_id,
-                        "version": self._version,
-                        "result": "detected",
-                        "detail": "timeout recycle",
-                    }
+            with self._lifecycle_lock:
+                factory = self._adapter_factory
+                context = dict(self._context)
+            if factory is None:
+                raise RuntimeError(
+                    "cannot recover timed-out in-process adapter without a factory"
                 )
-            # READY is set LAST so that an observer of the readiness store
-            # can rely on the WORKER_RESTART audit entry already being
-            # written (deterministic tests / acceptance evidence).
-            if self._readiness is not None:
-                self._readiness.set(self._app_id, AppStatus.READY)
+            replacement = factory()
+            replacement.initialize(context)
+            with self._lifecycle_lock:
+                if (
+                    self._stopped
+                    or generation != self._generation
+                    or self._recycling_generation != generation
+                ):
+                    return
+                self._adapter = replacement
+                if self._audit is not None:
+                    self._audit.append(
+                        {
+                            "action": "WORKER_RESTART",
+                            "app_id": self._app_id,
+                            "version": self._version,
+                            "result": "detected",
+                            "detail": "timeout recycle",
+                        }
+                    )
+                # READY is committed under the lifecycle lock and after the
+                # audit, so stop/restart cannot interleave with this commit.
+                if self._readiness is not None:
+                    self._readiness.set(self._app_id, AppStatus.READY)
+                self._recycling_generation = None
+                self._broken = False
+                replacement = None
         except Exception:
-            # Readiness stays BACKOFF; the app stays gated (503).
-            if self._audit is not None:
-                self._audit.append(
-                    {
-                        "action": "WORKER_CRASH",
-                        "app_id": self._app_id,
-                        "version": self._version,
-                        "result": "detected",
-                        "detail": "timeout recycle failed",
-                    }
-                )
+            with self._lifecycle_lock:
+                if (
+                    not self._stopped
+                    and generation == self._generation
+                    and self._recycling_generation == generation
+                    and self._audit is not None
+                ):
+                    # Readiness stays BACKOFF; the app stays gated (503).
+                    self._audit.append(
+                        {
+                            "action": "WORKER_CRASH",
+                            "app_id": self._app_id,
+                            "version": self._version,
+                            "result": "detected",
+                            "detail": "timeout recycle failed",
+                        }
+                    )
         finally:
-            self._recycling = False
+            if replacement is not None:
+                try:
+                    replacement.shutdown()
+                except Exception:
+                    pass
+            with self._lifecycle_lock:
+                if self._recycling_generation == generation:
+                    self._recycling_generation = None
 
     def stop(self, app_id: str) -> None:
-        adapter = self._adapter
+        with self._lifecycle_lock:
+            self._generation += 1
+            self._recycling_generation = None
+            self._broken = True
+            self._stopped = True
+            adapter = self._adapter
+            abandoned_executor = self._executor
+            self._executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="sydeco-worker"
+            )
+        abandoned_executor.shutdown(wait=False, cancel_futures=True)
         if adapter is not None:
             try:
                 adapter.shutdown()
@@ -240,40 +359,65 @@ class InProcessWorkerHost(WorkerHost):
                 pass
 
     def restart(self, app_id: str) -> None:
-        if self._adapter is None or not self._context:
-            raise RuntimeError(f"cannot restart {app_id}: never started")
-        # Not ready while re-initializing (Day 1B: a restarting worker must
-        # not serve inference — same rule the readiness store enforces).
-        self._broken = True
-        try:
-            self._adapter.initialize(self._context)
-        finally:
-            self._broken = False
+        with self._lifecycle_lock:
+            if self._adapter is None or not self._context:
+                raise RuntimeError(f"cannot restart {app_id}: never started")
+            self._generation += 1
+            generation = self._generation
+            self._recycling_generation = None
+            self._broken = True
+            self._stopped = False
+            factory = self._adapter_factory
+            current = self._adapter
+            context = dict(self._context)
+
+        replacement = factory() if factory is not None else current
+        assert replacement is not None
+        replacement.initialize(context)
+
+        with self._lifecycle_lock:
+            stale = self._stopped or generation != self._generation
+            if not stale:
+                self._adapter = replacement
+                self._broken = False
+        if stale:
+            if factory is not None:
+                try:
+                    replacement.shutdown()
+                except Exception:
+                    pass
+            raise WorkerNotReady(f"restart generation superseded: {app_id}")
 
     def status(self, app_id: str) -> str:
-        if self._broken:
-            return AppStatus.BACKOFF.value
-        return AppStatus.READY.value if self._adapter is not None else AppStatus.IDLE.value
+        with self._lifecycle_lock:
+            if self._stopped:
+                return AppStatus.IDLE.value
+            if self._broken:
+                return AppStatus.BACKOFF.value
+            return AppStatus.READY.value if self._adapter is not None else AppStatus.IDLE.value
 
     def simulate_crash(self) -> None:
         """DEV-ONLY test hook: break this worker (isolation test P6)."""
-        self._broken = True
-        if self._readiness is not None:
-            self._readiness.set(
-                self._app_id, AppStatus.BACKOFF, detail="simulated crash (test hook)"
-            )
-        if self._audit is not None:
-            self._audit.append(
-                {
-                    "action": "worker_crash",
-                    "app_id": self._app_id,
-                    "version": self._version,
-                    "result": "simulated",
-                }
-            )
+        with self._lifecycle_lock:
+            self._broken = True
+            if self._readiness is not None:
+                self._readiness.set(
+                    self._app_id, AppStatus.BACKOFF, detail="simulated crash (test hook)"
+                )
+            if self._audit is not None:
+                self._audit.append(
+                    {
+                        "action": "worker_crash",
+                        "app_id": self._app_id,
+                        "version": self._version,
+                        "result": "simulated",
+                    }
+                )
 
     def shutdown(self) -> None:
-        self._executor.shutdown(wait=False)
+        self.stop(self._app_id)
+        with self._lifecycle_lock:
+            self._executor.shutdown(wait=False, cancel_futures=True)
 
 
 def allocate_port(host: str = "127.0.0.1") -> int:
@@ -357,7 +501,10 @@ class SystemdTransientWorkerHost(WorkerHost):
     # ---- lifecycle -----------------------------------------------------
 
     def start(
-        self, app_id: str, version: str, adapter: Optional[Adapter],
+        self,
+        app_id: str,
+        version: str,
+        adapter: Optional[Union[Adapter, Callable[[], Adapter]]],
         context: Dict[str, Any],
     ) -> None:
         """Launch the worker as a systemd transient unit and wait ready.
