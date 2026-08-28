@@ -332,9 +332,17 @@ class SecurityTests(unittest.TestCase):
             os.environ,
             PYTHONPYCACHEPREFIX=tempfile.mkdtemp(prefix="sydeco-sec-pycache-"),
         )
+        # Day 2 (P3): the worker fails closed without a credential — the
+        # dev/test path passes a credential FILE (path on the command line,
+        # secret never in argv/env). The systemd path uses LoadCredential=.
+        cred_dir = tempfile.mkdtemp(prefix="sydeco-sec-cred-")
+        cred_file = os.path.join(cred_dir, "worker-secret")
+        with open(cred_file, "w", encoding="utf-8") as fh:
+            fh.write("a" * 64)
         proc = subprocess.Popen(
             [sys.executable, "-m", "sydeco_lightml_core.worker_runtime",
-             "--app-root", app_root, "--port", str(port)],
+             "--app-root", app_root, "--port", str(port),
+             "--credential-file", cred_file],
             cwd=repo, env=env,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
@@ -346,7 +354,10 @@ class SecurityTests(unittest.TestCase):
                     break
                 try:
                     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=1)
-                    conn.request("GET", "/health/ready")
+                    # Day 2 (P4): /health/ready is AUTHENTICATED — the probe
+                    # must present the worker credential
+                    conn.request("GET", "/health/ready",
+                                 headers={"Authorization": "Bearer " + "a" * 64})
                     resp = conn.getresponse()
                     resp.read()
                     conn.close()

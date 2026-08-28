@@ -345,6 +345,9 @@ class CoreService:
             "python": sys.executable,
             "cwd": repo_root,
             "pythonpath": repo_root,
+            # Day 2 (P3): Core secrets area for the ephemeral LoadCredential
+            # file (root-only 0600, per launch, removed on stop — D5 #4).
+            "credential_dir": os.path.join(self.data_dir, "secrets"),
         }
         host = self._hosts.get(app_id)
         if host is None:

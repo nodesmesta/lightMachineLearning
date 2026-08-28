@@ -15,6 +15,8 @@ from __future__ import annotations
 import abc
 import concurrent.futures
 import json
+import os
+import secrets
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -138,6 +140,10 @@ class InProcessWorkerHost(WorkerHost):
         self._stopped = True
         self._recycling_generation: Optional[int] = None
         self._generation = 0
+        # Day 2 (2026-08-28): in-memory per-generation credential, rotated
+        # on every recycle (D5 #5 — test-only dev equivalent of the systemd
+        # LoadCredential path; honest label, never written anywhere).
+        self._secret: Optional[str] = None
         self._lifecycle_lock = threading.RLock()
         self._readiness = readiness
         self._audit = audit
@@ -174,6 +180,8 @@ class InProcessWorkerHost(WorkerHost):
             self._recycling_generation = None
             self._broken = True
             self._stopped = False
+            # fresh in-memory credential for this generation (D5 #5)
+            self._secret = secrets.token_hex(32)
             factory = self._adapter_factory
 
         if candidate is None:
@@ -295,6 +303,9 @@ class InProcessWorkerHost(WorkerHost):
                 ):
                     return
                 self._adapter = replacement
+                # the replacement generation gets a FRESH in-memory
+                # credential; the old one is dead (D5 #5)
+                self._secret = secrets.token_hex(32)
                 if self._audit is not None:
                     self._audit.append(
                         {
@@ -367,6 +378,8 @@ class InProcessWorkerHost(WorkerHost):
             self._recycling_generation = None
             self._broken = True
             self._stopped = False
+            # fresh in-memory credential for the new generation (D5 #5)
+            self._secret = secrets.token_hex(32)
             factory = self._adapter_factory
             current = self._adapter
             context = dict(self._context)
@@ -496,6 +509,15 @@ class SystemdTransientWorkerHost(WorkerHost):
         self._last_throttled = 0
         self._pids_flagged = False
         self._recycling = False
+        # Day 2 (2026-08-28): the check/set of _recycling must be atomic —
+        # the Core HTTP server is multithreaded and two simultaneous timeouts
+        # could otherwise spawn two recycle threads (reviewer P0). Small
+        # local lock only; no WorkerManager redesign (D4).
+        self._recycle_lock = threading.Lock()
+        # per-generation credential (P1/P2): in-memory on the Core side,
+        # delivered to the worker ONLY via systemd LoadCredential= (P3).
+        self._secret: Optional[str] = None
+        self._credential_path: Optional[str] = None
         self._launch_count = 0
 
     # ---- lifecycle -----------------------------------------------------
@@ -543,6 +565,26 @@ class SystemdTransientWorkerHost(WorkerHost):
         self._unit = unit
         self._last_context = dict(context)
 
+        # Day 2 (P1/P2): fresh cryptographically random secret per worker
+        # generation (secrets.token_hex(32) == token_bytes(32), hex).
+        self._secret = secrets.token_hex(32)
+        # P3 delivery: ephemeral root-only (0600) file in the Core secrets
+        # area, unique per launch. The worker NEVER sees this path — systemd
+        # (root) reads it and exposes it as $CREDENTIALS_DIRECTORY/
+        # worker-secret inside the unit. Removed in stop().
+        self._credential_path = None
+        credential_dir = context.get("credential_dir")
+        if credential_dir:
+            os.makedirs(credential_dir, exist_ok=True)
+            cred_path = os.path.join(
+                credential_dir, f"{app_id}-{self._launch_count}.secret"
+            )
+            fd = os.open(cred_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(self._secret + "\n")
+            os.chmod(cred_path, 0o600)
+            self._credential_path = cred_path
+
         python = context.get("python", sys.executable)
         cmd = [
             python, "-m", "sydeco_lightml_core.worker_runtime",
@@ -588,6 +630,11 @@ class SystemdTransientWorkerHost(WorkerHost):
             props.append(f"WorkingDirectory={cwd}")
         if pythonpath:
             props.append(f"Environment=PYTHONPATH={pythonpath}")
+        if self._credential_path:
+            # systemd 249 has no --load-credential CLI option; the unit
+            # property is set via the generic transient-unit mechanism
+            # (reviewer P2: LoadCredential=, NOT command line / env).
+            props.append(f"LoadCredential=worker-secret:{self._credential_path}")
 
         argv = (
             ["systemd-run", f"--unit={unit}"]
@@ -635,6 +682,14 @@ class SystemdTransientWorkerHost(WorkerHost):
                 ["systemctl", "kill", "-s", "SIGKILL", unit],
                 capture_output=True, text=True, timeout=30,
             )
+        # P3: the ephemeral credential file is removed when the unit stops
+        # (best-effort; the unit already stopped, nothing reads it anymore).
+        if self._credential_path is not None:
+            try:
+                os.unlink(self._credential_path)
+            except OSError:
+                pass
+            self._credential_path = None
         self._started = False
         self._ready = False
         if self._readiness is not None:
@@ -680,14 +735,18 @@ class SystemdTransientWorkerHost(WorkerHost):
         if not self._started or not self._ready:
             raise WorkerNotReady(f"worker not ready: {self._app_id}")
         body = json.dumps(request).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self._secret is not None:
+            # Day 2 (P3/P4): every Core->worker call carries the current
+            # generation's Bearer credential (never logged, never in argv).
+            headers["Authorization"] = "Bearer " + self._secret
         conn = None
         try:
             conn = http.client.HTTPConnection(
                 "127.0.0.1", self._port, timeout=self._timeout
             )
             conn.request(
-                "POST", "/infer", body=body,
-                headers={"Content-Type": "application/json"},
+                "POST", "/infer", body=body, headers=headers
             )
             resp = conn.getresponse()
             data = resp.read()
@@ -738,9 +797,15 @@ class SystemdTransientWorkerHost(WorkerHost):
         """
         import threading
 
-        if self._recycling:
-            return
-        self._recycling = True
+        # P0 (reviewer, 2026-08-28): the Core HTTP server is multithreaded —
+        # two simultaneous timeouts on the SAME capability must produce
+        # EXACTLY ONE recycle. The check/set of _recycling is atomic under
+        # the local lock; a concurrent second caller sees _recycling=True
+        # and returns without spawning a second recycle thread.
+        with self._recycle_lock:
+            if self._recycling:
+                return
+            self._recycling = True
         self._ready = False
         if self._readiness is not None:
             self._readiness.set(
@@ -764,7 +829,8 @@ class SystemdTransientWorkerHost(WorkerHost):
             # Readiness stays BACKOFF; the monitor audits the failure.
             self._audit_event("WORKER_CRASH", detail="timeout recycle failed")
         finally:
-            self._recycling = False
+            with self._recycle_lock:
+                self._recycling = False
 
     # ---- readiness polling (G1) ----------------------------------------
 
@@ -773,10 +839,13 @@ class SystemdTransientWorkerHost(WorkerHost):
         import time
 
         deadline = time.time() + self._ready_wait
+        headers = {}
+        if self._secret is not None:
+            headers["Authorization"] = "Bearer " + self._secret
         while time.time() < deadline:
             try:
                 conn = http.client.HTTPConnection("127.0.0.1", self._port, timeout=2)
-                conn.request("GET", "/health/ready")
+                conn.request("GET", "/health/ready", headers=headers)
                 resp = conn.getresponse()
                 resp.read()
                 conn.close()

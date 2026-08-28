@@ -48,8 +48,96 @@ log = logging.getLogger("sydeco-lightml.worker-runtime")
 WORKER_BIND_HOST = "127.0.0.1"
 
 
+def load_worker_secret(credential_file: Optional[str]) -> str:
+    """Day 2 (P3): read the worker credential — the ONLY delivery paths.
+
+    1. systemd LoadCredential= -> $CREDENTIALS_DIRECTORY/worker-secret
+       (the production path; the source file is root-only and is never
+       visible to the worker — systemd injects it into the unit).
+    2. --credential-file <path> (explicit dev/test approximation: the
+       PATH may appear on the command line, the SECRET never does).
+
+    Fail-closed: no credential -> WorkerRuntimeError -> the unit fails
+    (there is deliberately NO unauthenticated worker mode).
+    """
+    secret: Optional[str] = None
+    cred_dir = os.environ.get("CREDENTIALS_DIRECTORY")
+    if cred_dir:
+        path = os.path.join(cred_dir, "worker-secret")
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                secret = fh.read().strip()
+        except OSError:
+            secret = None
+    if not secret and credential_file:
+        try:
+            with open(credential_file, "r", encoding="utf-8") as fh:
+                secret = fh.read().strip()
+        except OSError:
+            secret = None
+    if not secret:
+        raise WorkerRuntimeError(
+            "no worker credential configured "
+            "(CREDENTIALS_DIRECTORY/worker-secret or --credential-file)"
+        )
+    return secret
+
+
 class WorkerRuntimeError(Exception):
     """Worker failed to initialize (exit non-zero -> unit fails)."""
+
+
+def _audit_auth_failure(runtime: Any, source: str) -> None:
+    """Append an AUTH_FAILURE event to the worker's OWN audit JSONL (C2).
+
+    The Core cannot observe 401s raised inside another process, so the
+    worker records auth failures itself in its writable data dir
+    (``<data_dir>/audit/audit.jsonl``). The event never contains the
+    credential or the presented token — only the source endpoint.
+    """
+    try:
+        data_dir = getattr(runtime, "data_dir", None)
+        if not data_dir:
+            return
+        audit_dir = os.path.join(data_dir, "audit")
+        os.makedirs(audit_dir, exist_ok=True)
+        entry = {
+            "action": "AUTH_FAILURE",
+            "app_id": getattr(runtime, "app_id", "?"),
+            "result": "rejected",
+            "detail": f"invalid bearer on {source}",
+            "timestamp": _now_iso(),
+        }
+        with open(
+            os.path.join(audit_dir, "audit.jsonl"), "a", encoding="utf-8"
+        ) as fh:
+            fh.write(json.dumps(entry, sort_keys=True) + "\n")
+    except Exception:
+        # audit must never break serving
+        pass
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _check_bearer(runtime: Any) -> bool:
+    """Constant-time comparison of the presented Bearer (P4).
+
+    Requires ``Authorization: Bearer <token>``; ``hmac.compare_digest``
+    against the worker's loaded secret. No unauth'd worker endpoint.
+    """
+    import hmac
+
+    presented = getattr(runtime, "presented_token", None)
+    if not presented:
+        return False
+    secret = getattr(runtime, "secret", None)
+    if not secret:
+        return False
+    return hmac.compare_digest(presented.encode("utf-8"), secret.encode("utf-8"))
 
 
 def load_adapter(manifest: Dict[str, Any], app_root: str) -> Any:
@@ -113,12 +201,24 @@ class WorkerHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
+        runtime = getattr(self.server, "runtime")
+        # per-request presented token (never stored, never logged)
+        auth = self.headers.get("Authorization", "")
+        token: Optional[str] = None
+        if auth.startswith("Bearer "):
+            token = auth[len("Bearer "):].strip() or None
+        runtime.presented_token = token
         if path == "/health/live":
+            if not _check_bearer(runtime):
+                _audit_auth_failure(runtime, "health/live")
+                self._error(401, "unauthorized")
+                return
             self._send_json(200, {"status": "ok"})
         elif path == "/health/ready":
-            # Serving started only AFTER models loaded + adapter.initialize
-            # succeeded (see run_worker), so up == ready (E6 warm-up for
-            # the PoCs is instant).
+            if not _check_bearer(runtime):
+                _audit_auth_failure(runtime, "health/ready")
+                self._error(401, "unauthorized")
+                return
             self._send_json(200, {"status": "ready"})
         else:
             self._error(404, "unknown endpoint")
@@ -129,6 +229,17 @@ class WorkerHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path != "/infer":
             self._error(404, "unknown endpoint")
+            return
+        runtime = getattr(self.server, "runtime")
+        # per-request presented token (never stored, never logged)
+        auth = self.headers.get("Authorization", "")
+        token: Optional[str] = None
+        if auth.startswith("Bearer "):
+            token = auth[len("Bearer "):].strip() or None
+        runtime.presented_token = token
+        if not _check_bearer(runtime):
+            _audit_auth_failure(runtime, "infer")
+            self._error(401, "unauthorized")
             return
         length = self.headers.get("Content-Length")
         if length is None:
@@ -177,6 +288,7 @@ def run_worker(
     app_root: str,
     port: int,
     data_dir: Optional[str] = None,
+    credential_file: Optional[str] = None,
 ) -> None:
     """Initialize (load + adapter.initialize) then serve on 127.0.0.1.
 
@@ -197,6 +309,10 @@ def run_worker(
     if data_dir:
         os.makedirs(data_dir, exist_ok=True)
 
+    # Day 2 (P3): the credential is loaded BEFORE serving; the worker
+    # fails closed when none is configured (see load_worker_secret).
+    worker_secret = load_worker_secret(credential_file)
+
     context = build_context(manifest, models, data_dir)
     adapter.initialize(context)  # R4: failure -> not ready -> unit fails
 
@@ -205,6 +321,10 @@ def run_worker(
         context=context,
         infer_lock=threading.Lock(),
         request_id=lambda: "w-" + os.urandom(6).hex(),
+        secret=worker_secret,
+        app_id=manifest.get("app_id", "?"),
+        data_dir=data_dir,
+        presented_token=None,
     )
     httpd = WorkerRuntimeServer((WORKER_BIND_HOST, port), runtime)
 
@@ -239,9 +359,16 @@ def main(argv: Optional[list] = None) -> int:
     ap.add_argument("--app-root", required=True, help="versioned app dir (manifest.json)")
     ap.add_argument("--port", type=int, required=True, help="Core-assigned loopback port")
     ap.add_argument("--data-dir", default=None, help="app's own writable data dir")
+    ap.add_argument(
+        "--credential-file", default=None,
+        help="dev/test credential file (path only; the secret is never on "
+        "the command line). Production uses systemd LoadCredential=.",
+    )
     args = ap.parse_args(argv)
     try:
-        run_worker(args.app_root, args.port, args.data_dir)
+        run_worker(
+            args.app_root, args.port, args.data_dir, args.credential_file
+        )
     except WorkerRuntimeError as exc:
         log.error("worker init failed: %s", exc)
         return 1
