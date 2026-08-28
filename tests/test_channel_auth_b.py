@@ -152,7 +152,63 @@ class ChannelAuthFaseBTests(unittest.TestCase):
                 except subprocess.TimeoutExpired:
                     proc.kill()
 
-    def test_02_auth_failure_is_audited_worker_side(self) -> None:
+    def test_02_concurrent_mixed_tokens_never_share_request_state(self) -> None:
+        """A valid and invalid concurrent request must not cross-authenticate."""
+        import types
+        from unittest.mock import patch
+
+        from sydeco_lightml_core import worker_runtime as wr
+
+        secret = "q" * 64
+        barrier = threading.Barrier(2)
+
+        class _Adapter:
+            def infer(self, request, context):
+                return {"ok": True}
+
+        runtime = types.SimpleNamespace(
+            adapter=_Adapter(), context={}, infer_lock=threading.Lock(),
+            request_id=lambda: "race", secret=secret, app_id="race",
+            data_dir=None,
+        )
+        httpd = wr.WorkerRuntimeServer(("127.0.0.1", 0), runtime)
+        server_thread = threading.Thread(
+            target=httpd.serve_forever, daemon=True
+        )
+        server_thread.start()
+        port = httpd.server_address[1]
+
+        original_check = wr._check_bearer
+
+        def synchronized_check(runtime, presented):
+            barrier.wait(timeout=3)
+            return original_check(runtime, presented)
+
+        results = []
+
+        def request(token):
+            status, _ = _request(port, "GET", "/health/live", token)
+            results.append((token == secret, status))
+
+        try:
+            with patch.object(wr, "_check_bearer", synchronized_check):
+                threads = [
+                    threading.Thread(target=request, args=(secret,)),
+                    threading.Thread(target=request, args=("w" * 64,)),
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=5)
+            self.assertEqual(len(results), 2)
+            self.assertEqual(
+                sorted(results), [(False, 401), (True, 200)]
+            )
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_03_auth_failure_is_audited_worker_side(self) -> None:
         app_root = os.path.join(REPO, "examples", "text-classifier")
         secret = "a1" * 32
         cred_file = os.path.join(self._tmp, "worker-secret")

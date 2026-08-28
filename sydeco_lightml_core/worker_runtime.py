@@ -123,7 +123,7 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
-def _check_bearer(runtime: Any) -> bool:
+def _check_bearer(runtime: Any, presented: Optional[str]) -> bool:
     """Constant-time comparison of the presented Bearer (P4).
 
     Requires ``Authorization: Bearer <token>``; ``hmac.compare_digest``
@@ -131,7 +131,6 @@ def _check_bearer(runtime: Any) -> bool:
     """
     import hmac
 
-    presented = getattr(runtime, "presented_token", None)
     if not presented:
         return False
     secret = getattr(runtime, "secret", None)
@@ -207,15 +206,14 @@ class WorkerHandler(BaseHTTPRequestHandler):
         token: Optional[str] = None
         if auth.startswith("Bearer "):
             token = auth[len("Bearer "):].strip() or None
-        runtime.presented_token = token
         if path == "/health/live":
-            if not _check_bearer(runtime):
+            if not _check_bearer(runtime, token):
                 _audit_auth_failure(runtime, "health/live")
                 self._error(401, "unauthorized")
                 return
             self._send_json(200, {"status": "ok"})
         elif path == "/health/ready":
-            if not _check_bearer(runtime):
+            if not _check_bearer(runtime, token):
                 _audit_auth_failure(runtime, "health/ready")
                 self._error(401, "unauthorized")
                 return
@@ -236,8 +234,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
         token: Optional[str] = None
         if auth.startswith("Bearer "):
             token = auth[len("Bearer "):].strip() or None
-        runtime.presented_token = token
-        if not _check_bearer(runtime):
+        if not _check_bearer(runtime, token):
             _audit_auth_failure(runtime, "infer")
             self._error(401, "unauthorized")
             return
@@ -324,7 +321,6 @@ def run_worker(
         secret=worker_secret,
         app_id=manifest.get("app_id", "?"),
         data_dir=data_dir,
-        presented_token=None,
     )
     httpd = WorkerRuntimeServer((WORKER_BIND_HOST, port), runtime)
 
