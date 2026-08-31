@@ -4,6 +4,10 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+# J1/J2 per-app dependency material — the app's venv and wheelhouse are
+# built at install time from the (versioned) bundle; never commit a built
+# venv or a wheelhouse here.
+wheelhouse/
 
 # Local dev data (registry, audit, etc.) — NOT versioned.
 # Evidence files (data/evidence_*.txt) ARE versioned so the delivered

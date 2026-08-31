@@ -16,6 +16,7 @@ from __future__ import annotations
 import importlib.util
 import logging
 import os
+import shutil
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -248,12 +249,31 @@ class CoreService:
             return False, f"install rejected: {exc}", None
 
         # Step 5: register (F1) + audit (emitted by registry)
+        fs_paths: Dict[str, str] = {"app_root": app_root}
+        # J1/J2 (proposal 2.4): if the app declares dependencies, build its
+        # OWN venv from its local wheelhouse (offline, fail-closed) and record
+        # the per-app interpreter path so the worker starts with IT (P3), not
+        # the Core's interpreter. No global env is created; Core stays generic.
+        try:
+            fs_paths = self.build_app_venv(app_id, manifest, app_root)
+        except Exception as exc:
+            self.audit.append(
+                {
+                    "action": "install",
+                    "app_id": app_id,
+                    "result": "fail",
+                    "reason": "environment build failed",
+                    "detail": str(exc),
+                }
+            )
+            return False, f"install rejected: {exc}", None
+
         entry = self.registry.register(
             app_id=app_id,
             version=version,
             manifest=manifest,
             artifact_hashes=hashes,
-            filesystem_paths={"app_root": app_root},
+            filesystem_paths=fs_paths,
         )
 
         # K2/R8: per-app Bearer token generated at install. Returned ONCE
@@ -267,6 +287,123 @@ class CoreService:
         return True, f"app registered: {app_id} v{version}", entry
 
     # ---- Day 2: worker hosting + serving -------------------------------
+
+    def build_app_venv(
+        self,
+        app_id: str,
+        manifest: Dict[str, Any],
+        app_root: str,
+    ) -> Dict[str, str]:
+        """J1/J2 (proposal 2.4): create the application's OWN Python venv
+        from its LOCAL wheelhouse only — no Internet, no global env, Core
+        stays generic.
+
+        Returns an updated ``filesystem_paths`` dict adding ``venv`` (the
+        per-app interpreter directory) and ``wheelhouse`` (its local bundle
+        source). ``venv`` is placed INSIDE the versioned app dir (V2.1 E2/
+        R7 layout) and git-ignored, so it is not shipped in the package.
+
+        Fail-closed (J2/P2): if the manifest declares dependencies that are
+        NOT available in the app's local wheelhouse, installation fails —
+        never a partial/half-valid environment, never a silently-wrong
+        version. Wording (standing): needs no Internet beyond OS
+        dependencies.
+        """
+        filesystem_paths: Dict[str, str] = {"app_root": app_root}
+        deps = manifest.get("dependencies", [])
+        if not deps:
+            # J1 keeps a per-app venv only for apps that declare dependency
+            # isolation needs; an app with no dependencies has no wheelhouse
+            # to build from (proposal J2: dependencies absent => no wheels).
+            return filesystem_paths
+
+        import subprocess
+
+        wheelhouse = os.path.join(app_root, "wheelhouse")
+        venv_dir = os.path.join(app_root, "venv")
+        filesystem_paths["wheelhouse"] = wheelhouse
+        filesystem_paths["venv"] = venv_dir
+
+        # J4 (proposal 2.4): the wheels declared in the manifest must match
+        # what is actually present in the bundle wheelhouse; mismatch REJECT.
+        if not os.path.isdir(wheelhouse):
+            raise RuntimeError(
+                f"install rejected: no wheelhouse dir for {app_id} but "
+                f"dependencies {[d['name'] for d in deps]} are declared"
+            )
+        declared = {(d["name"], d.get("version")) for d in deps}
+        have_wheels = set()
+        for fn in sorted(os.listdir(wheelhouse)):
+            # wheelhouse entries are .whl (or .tar.gz for sdist fallback).
+            # Extract (name, version-ish) from the wheel filename, e.g.
+            #   depballast_a-2.0.0-py3-none-any.whl  -> ('depballast-a','2.0.0')
+            base = fn.split(".whl")[0] or fn.split(".tar.gz")[0]
+            parts = base.split("-")
+            if len(parts) >= 2:
+                have_wheels.add((parts[0].replace("_", "-"), parts[1]))
+        if not declared.issubset(have_wheels):
+            missing = declared - have_wheels
+            raise RuntimeError(
+                f"install rejected: dependency not in local wheelhouse: "
+                f"{sorted(missing)} (no Internet; needs no Internet beyond "
+                f"OS dependencies)"
+            )
+
+        # Build the per-app venv from the app wheelhouse (offline) and install
+        # ITS declared dependencies ONLY from its local wheelhouse. Any failure
+        # must leave NO half-valid environment (reviewer P5).
+        venv_created = False
+        try:
+            # Verify dependency material integrity up front (existing
+            # trust/integrity architecture, J2/J4): a corrupted/mis-named wheel
+            # is REJECTED here, before any venv is built.
+            import zipfile
+
+            for fn in sorted(os.listdir(wheelhouse)):
+                if fn.endswith(".whl"):
+                    wp = os.path.join(wheelhouse, fn)
+                    try:
+                        with zipfile.ZipFile(wp) as zf:
+                            if zf.testzip() is not None:
+                                raise RuntimeError("corrupt wheel payload")
+                    except (zipfile.BadZipFile, OSError, RuntimeError) as exc:
+                        raise RuntimeError(
+                            f"install rejected: corrupt dependency material "
+                            f"{fn}: {exc}"
+                        )
+
+            # Create the per-app venv. venv creation needs only OS-dependency
+            # python3-venv/ensurepip.
+            subprocess.run(
+                ["python3", "-m", "venv", venv_dir],
+                capture_output=True, text=True, check=True, timeout=120,
+            )
+            venv_created = True
+            py = os.path.join(venv_dir, "bin", "python")
+            if not os.path.isfile(py):
+                raise RuntimeError(
+                    f"install rejected: venv missing interpreter: {py}"
+                )
+            # Install ONLY from the local wheelhouse — --no-index,
+            # --find-links, no PyPI lookup, no implicit network fallback.
+            proc = subprocess.run(
+                [py, "-m", "pip", "install", "--no-index",
+                 "--no-deps", f"--find-links={wheelhouse}",
+                 *[f"{name}=={version}" for name, version in sorted(declared)]],
+                capture_output=True, text=True, timeout=300,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"install rejected: offline pip install failed for "
+                    f"{app_id}: {(proc.stderr or proc.stdout).strip()}"
+                )
+        except BaseException:
+            # Reviewer P5: failed installation leaves NO half-valid
+            # environment — remove the partially-created venv on any failure.
+            if venv_created and os.path.isdir(venv_dir):
+                shutil.rmtree(venv_dir, ignore_errors=True)
+            raise
+        return filesystem_paths
 
     def _provision_capability_user(self, app_id: str) -> Optional[str]:
         """D3a / L2 (2.9): create the dedicated capability OS user.
@@ -304,6 +441,7 @@ class CoreService:
         manifest: Dict[str, Any],
         version: str,
         app_root: str,
+        venv: Optional[str] = None,
     ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
         """D1c: start one app's worker as a systemd TRANSIENT unit.
 
@@ -312,6 +450,12 @@ class CoreService:
         mode. Core assigns the loopback port (D2 req 1), launches the
         unit with User=sydeco-cap-<id> (D3a) + cgroup/sandbox properties
         from the manifest (A3/3.3), then polls /health/ready (G1).
+
+        J1/J2/P3: when the app owns a venv (``venv`` path from the
+        registry), the worker is launched with THAT app-specific
+        interpreter (``<venv>/bin/python``), NOT the Core's ``sys.executable``.
+        This proves per-application Python isolation (app A uses A's
+        Python, app B uses B's Python; Core never loads app deps).
         """
         app_data_dir = os.path.join(self.data_dir, "apps", app_id, "data")
         # The data dir MUST exist BEFORE systemd-run: under
@@ -336,13 +480,22 @@ class CoreService:
             "SYDECO_LIGHTML_WORKER_REPO",
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         )
+        # J1/J2/P3 (proposal 2.4): the worker uses the APP'S OWN interpreter
+        # (per-app venv) when it has one; otherwise it falls back to the
+        # Core's sys.executable (apps with no declared dependencies). Never
+        # does the Core load the application's Python dependencies.
+        app_python = sys.executable
+        if venv:
+            candidate = os.path.join(venv, "bin", "python")
+            if os.path.isfile(candidate):
+                app_python = candidate
         context: Dict[str, Any] = {
             "app_root": app_root,
             "config": manifest,
             "data_dir": app_data_dir,
             "port": allocate_port(),            # D2 req 1: Core assigns
             "user": f"sydeco-cap-{app_id}",     # D3a
-            "python": sys.executable,
+            "python": app_python,               # J1/J2: per-app interpreter
             "cwd": repo_root,
             "pythonpath": repo_root,
             # Day 2 (P3): Core secrets area for the ephemeral LoadCredential
@@ -412,7 +565,8 @@ class CoreService:
         if self.worker_mode == "systemd":
             # D1c: worker as a systemd transient unit — models load INSIDE
             # the worker (A1), adapter lives in the worker (3.0/R3).
-            return self._start_app_systemd(app_id, manifest, version, app_root)
+            venv = info["filesystem_paths"].get("venv")
+            return self._start_app_systemd(app_id, manifest, version, app_root, venv)
 
         try:
             models = load_artifacts(manifest, app_root)  # E5 at every start

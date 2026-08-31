@@ -1,0 +1,60 @@
+# evidence_day3_j12_venv_isolation.txt
+Date: 2026-08-31
+Repo: /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV
+
+## Summary
+Phase 2 / Day 3 (J1/J2) — per-application Python dependency isolation proven
+(offline wheelhouse, per-app venv, per-app interpreter). Two deterministic
+apps, App A and App B, both depend on the stdlib-only test package
+``depballast`` but at INCOMPATIBLE versions (A -> 1.0.0, B -> 2.0.0). Each
+app's venv was built by Core (``CoreService.build_app_venv``) exclusively from
+its OWN local wheelhouse (J2: ``pip install --no-index --find-links=<wheelhouse>``;
+no PyPI, no network, no Core-env pickup). The worker for each app is launched
+with ITS OWN interpreter (P3), and the Core/global Python never sees the
+dependency. Proven end-to-end by ``tests/test_dep_isolation.py`` (5/5 PASS).
+
+## Architecture path used for each application's venv (J1)
+Each app that declares ``dependencies`` gets a venv INSIDE its versioned app
+dir (proposal V2.1 E2/R7):
+
+    <app_root>/venv            <- per-app Python venv (python3 -m venv)
+    <app_root>/wheelhouse/     <- the app's OWN offline wheel source (J2/J4)
+
+Registry stores the resolved paths per version (``filesystem_paths``):
+    {"app_root": ..., "venv": ..., "wheelhouse": ...}
+and the worker launch resolves the venv interpreter from the registry (M1/
+C3): app_id + version -> application files + models + dedicated venv + worker.
+
+## Wheelhouse / offline mechanism (J2)
+- Each app ships its dependency wheels in its bundle's ``wheelhouse/`` dir.
+- Core builds the app venv and installs ONLY from that dir:
+      python3 -m venv <app_root>/venv
+      <app_root>/venv/bin/python -m pip install --no-index --no-deps \
+          --find-links=<app_root>/wheelhouse "depballast==<ver>"
+- No PyPI lookup, no implicit network fallback, no dependency silently pulled
+  from the Core environment. Missing/unavailable/corrupt material -> REJECT,
+  no half-built venv left (fail-closed, reviewer P5).
+- Wording (standing): needs no Internet beyond OS dependencies.
+
+## Commands actually executed (offline wheel build + install)
+- Ballast wheel build (offline, stdlib-only fixture):
+      python3 -m pip wheel --no-deps --no-build-isolation \
+          --wheel-dir <tmp>/wheels ./srcv{1,2}
+  Produced: depballast-1.0.0-py3-none-any.whl, depballast-2.0.0-py3-none-any.whl
+- App-A/B venv build + install via Core.build_app_venv (commands above),
+  executed inside the unit test against per-app wheelhouse directories.
+
+## App A / App B incompatible-dependency proof (live)
+| App | declared dep version | installed | interpreter | behavior() | VERSION |
+|-----|----------------------|-----------|-------------|------------|---------|
+| app-a | depballast 1.0.0 | 1.0.0 | <app-a>/venv/bin/python | '1.0.0-behavior' | 1.0.0 |
+| app-b | depballast 2.0.0 | 2.0.0 | <app-b>/venv/bin/python | '2.0.0-behavior' | 2.0.0 |
+
+- Both apps coexist; each imports depballast from ITS OWN venv.
+- Breaking/removing App A's venv leaves App B serving 2.0.0 unchanged.
+- The Core/global python ``import depballast`` returns non-zero (dependency is
+  NOT visible outside the per-app venvs) — neither app modifies the Core env.
+
+## Regression count
+Full suite in the repo: 91 tests (86 prior + 5 new J1/J2) -> OK.
+Full suite from a fresh extraction: 91 tests -> OK. py_compile core: 17/17.
