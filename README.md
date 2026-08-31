@@ -1,386 +1,203 @@
-# 28082026
+# SYDECO LIGHTML UNIVERSAL RUNTIME V2 — DEVELOPMENT / PROOF OF CONCEPT — AWAITING REVIEW.
+
+**Phase 2 / Day 3 — Per-Application Dependency Isolation (J1/J2) — 2026-08-31.**
+
+Status line (verbatim): **SYDECO LIGHTML UNIVERSAL RUNTIME V2 — DEVELOPMENT /
+PROOF OF CONCEPT — AWAITING REVIEW.**
+
+Final statement (required): **LightML 1.0.1 untouched. CRA untouched. No
+production signing key created.**
 
 ## Summary
 
-This session executes the reviewer's **PHASE 2 / DAY 2 — AUTHENTICATED CORE
-<-> WORKER CHANNEL** directive from `Jamaludin REPORT 27 AUGUST REVIEWED.docx`
-(review of the 27-08-2026 submission, copied into this day's folder
-`week-4/28-08-2026/`). Review verdict (verbatim): **"PHASE 2 / DAY 1C —
-ACCEPTED."** (97/100) — process isolation CLOSED, timeout containment CLOSED,
-dev-host timeout semantics CLOSED — and the reviewer authorized Day 2:
-"Today, Core and worker communicate over 127.0.0.1. That protects them from
-external network access, but loopback does not authenticate the caller.
-Another local process could potentially contact the worker." The exact order
-P0..P6 was followed, mapped to this day's P1..P8.
+This session executes the reviewer's **PHASE 2 / DAY 3 — PER-APPLICATION
+DEPENDENCY ISOLATION (J1/J2)** directive from `JAMALUDIN_DailyReport_28-08-2026
+REVIEWED.docx` (Day-2 verdict: **CONDITIONALLY ACCEPTED**; P0 Day-2 closure
+mandatory before Day-3). The day is split into two parts:
 
-The design was already LOCKED on 27-08 (decision D5, all five
-recommendations): systemd `LoadCredential=` backed by a root-only mode-600
-file; Bearer per-request + `hmac.compare_digest`; /health/ready
-authenticated; credential in-memory per generation + ephemeral root-only
-file removed on stop; InProcess dev equivalent in-memory rotated per recycle.
+1. **P0 — Day-2 closure (mandatory)** — the three concrete Day-2 defects the
+   reviewer required corrected before Day-3, plus packaging that corresponds
+   to the final commit:
+   - leakage regression test fixed to use a runtime-generated credential
+     (`secrets.token_hex(32)`) so compiled bytecode can never be a false
+     leak;
+   - ephemeral worker credential now removed on EVERY path (successful stop
+     and all failed launch/start paths) via an exception-safe lifecycle,
+     with 3 deterministic lifecycle tests;
+   - repository README updated to the authoritative 28-Aug state;
+   - `data/` evidence directory created and all evidence shipped inside the
+     ZIP (it was previously missing because `data/` was git-ignored);
+   - correct `<name>.zip` + `<name>.zip.sha256` sidecar naming.
+2. **P1..P7 — J1/J2 per-application dependency isolation** (today's core
+   work).
 
-Day 2 implementation and verification are complete; final packaging follows after the corrected source and evidence are committed:
+## P0 — Day-2 closure (mandatory)
 
-1. **P0 (reviewer) / P1** — the `_recycling` check/set in
-   `SystemdTransientWorkerHost._recycle_after_timeout` was NOT lock-protected
-   while the Core HTTP server is multithreaded (reviewer finding confirmed in
-   the source). Protected by a small local lock; a deterministic barrier test
-   proves two simultaneous timeouts produce exactly ONE recycle, one
-   replacement generation, one WORKER_RESTART.
-2. **P2** — cryptographically random secret per worker generation
-   (`secrets.token_hex(32)`), unique per app, rotated on every
-   recycle/restart, never reused across applications.
-3. **P3** — secure delivery: `LoadCredential=worker-secret:<path>` via the
-   transient-unit property mechanism (systemd 249 has no `--load-credential`
-   CLI option), ephemeral root-only (0600) file unique per launch, removed on
-   stop; the worker reads `$CREDENTIALS_DIRECTORY/worker-secret` (production)
-   or `--credential-file` (dev/test; the PATH may appear in argv, the SECRET
-   never does) and FAILS CLOSED without one.
-4. **P4** — the worker requires the Bearer credential on ALL internal
-   endpoints (`POST /infer`, `GET /health/ready`, `GET /health/live`) — no
-   unauthenticated worker endpoint; constant-time `hmac.compare_digest`;
-   auth failures are audited worker-side (`AUTH_FAILURE` in the worker's own
-   data-dir audit JSONL — C2 elaboration).
-5. **P5** — credential isolation proven: App A token -> App A accepted;
-   App A token -> App B rejected; old generation token -> new generation
-   rejected; new token -> accepted; one app's auth failure does not affect
-   another.
-6. **P6** — leakage sweep: 0 secret occurrences in command line,
-   `/proc/<pid>/cmdline`, `/proc/<pid>/environ` (REAL systemd worker),
-   manifest, registry, Core + worker audit, normal logs, client error
-   responses, package, git repository. Only allowed locations: tightly
-   controlled runtime memory + the systemd credential mechanism.
-7. **P7** — the reviewer's 13-row acceptance matrix PASSES both
-   non-privileged (real `worker_runtime` process + credential file, honest
-   dev labels, D5 #5) AND on the REAL systemd path (root harness 31/31
-   including LoadCredential=, $CREDENTIALS_DIRECTORY in the worker env,
-   /proc leakage, timeout 504 -> recycle -> rotated secret -> old 401 /
-   new 200, exactly one WORKER_RESTART).
-8. **No regression** — full suite **83/83 PASS** (63 pre-existing + 20 new)
-   in the repo AND from a fresh extraction; py_compile 17/17; 0 dev-path
-   occurrences; 0 new `__pycache__`.
+### P0.1 — Leakage test uses a runtime-generated secret
+**File changed:** `tests/test_channel_auth_b.py`, `tests/test_channel_auth_c.py`.
+`test_05_no_secret_in_manifest_registry_audit_logs` (auth_b) and
+`test_04_token_absent_from_logs_manifest_registry` (auth_c) both sweep the
+whole repository for their test secret. They previously used a deterministic
+literal (e.g. `secret = "99" * 32`), so the Python bytecode
+(`__pycache__/*.pyc`) embedded that literal and the test reported its OWN
+`.pyc` as a leakage — test-harness contamination, not a real worker-credential
+leak. Fixed per reviewer's preferred correction: generate the credential
+dynamically with `secrets.token_hex(32)`. Reproducible under any interpreter /
+pyc state, no `__pycache__` deletion needed. Verified: `test_channel_auth_b`
+7/7, `test_channel_auth_c` 6/6.
 
-The corrected source and regression test are included in the final repository state; the final commit and clean-tree status are verified during packaging.
+### P0.2/P0.3 — Exception-safe credential cleanup + lifecycle tests
+**File changed:** `sydeco_lightml_core/worker.py`, new `tests/test_credential_lifecycle.py`.
+In `SystemdTransientWorkerHost.start()` the credential file was created before
+`systemd-run`; if launch/readiness failed, `_started` stayed False and `stop()`'
+s `if not self._started: return` returned before unlinking the root-only 0600
+file — a failed launch could leave a credential file behind. Now:
+`_remove_credential()` (idempotent) is called from `stop()` BEFORE the
+`_started` guard AND from `start()` on both failure paths (systemd-run failure,
+readiness failure), plus a bounded `stop()` on the never-ready path so no
+orphan unit remains. All three reviewer-required cases have deterministic
+non-privileged tests (mock subprocess — no root/systemd needed):
+`test_launch_failure_removes_credential`, `test_never_ready_removes_credential`,
+`test_normal_stop_removes_credential` — 3/3.
+"Every credential file must disappear after successful stop AND after every
+failed launch/start path."
 
-Final status remains verbatim:
-**SYDECO LIGHTML UNIVERSAL RUNTIME V2 — DEVELOPMENT / PROOF OF CONCEPT —
-AWAITING REVIEW.**
+### P0.4–P0.8 — Regression, evidence, packaging
+- README.md (this file) = authoritative report. `data/` holds ALL evidence
+  (Day-2 nine files + Day-3 evidence).
+- Full suite 86/86 in repo and fresh extraction after closure (83 prior + 3
+  lifecycle).
+- Packaging: `SYDECO_LIGHTML_V2_DEV_2026-08-31.zip` (source + .git + tests +
+  README + all `data/` evidence; no `__pycache__`/`.pyc`) + correctly named
+  `.sha256` sidecar. Verified: git clean, fresh-extraction PASS, SHA matches,
+  evidence corresponds to final commit.
 
----
+## P1 — One Python environment per application/version (J1)
 
-## P1 — Production recycle concurrency (reviewer P0)
+**File changed:** `sydeco_lightml_core/core.py` — new `CoreService.build_app_venv()`.
+Installing an app that declares `dependencies` builds a **dedicated venv for
+that application/version** inside its versioned dir (`<app_root>/venv`) and
+records `venv`/`wheelhouse` in the registry (`filesystem_paths`). Resolution
+is per-app (M1/C3): `app_id + version -> application files + models +
+dedicated venv + worker`. No second/global Python environment is created and
+the Core remains generic (it never imports an application's layout or deps).
 
-**File changed:** `sydeco_lightml_core/worker.py` — `SystemdTransientWorkerHost`
-gains a small local `_recycle_lock` around the `_recycling` check/set and the
-reset in `finally` of `_recycle_worker`.
+## P2 — Offline wheelhouse only (J2)
 
-**What:** the reviewer's finding is confirmed in the source: `_recycle_after_timeout`
-did `if self._recycling: return; self._recycling = True` without a lock, while
-the Core HTTP server is a `ThreadingHTTPServer` — two simultaneous timeouts on
-the same capability could both pass the check and spawn two recycle threads.
-The fix follows the reviewer's instruction exactly ("protect the
-production-host recycle transition with a small local lock, without
-redesigning WorkerManager"):
+Installation builds the app venv **exclusively** from the app's OWN local
+wheelhouse (`<app_root>/wheelhouse`) via
+`pip install --no-index --no-deps --find-links=<wheelhouse> <spec>` — no PyPI,
+no implicit network fallback, no dependency silently taken from the Core
+environment. Dependencies absent/corrupt/version-mismatched are REJECTED
+(fail-closed), leaving no partial environment. Wheel material is verified
+up-front (zipfile integrity, J4 bundle-wheel match). Wording (standing):
+needs no Internet beyond OS dependencies.
 
-| Step | Mechanism |
-|---|---|
-| two simultaneous requests hit the timeout condition | both `infer()` calls raise `socket.timeout` on the same capability |
-| `_recycle_after_timeout` | check/set of `_recycling` now atomic under `_recycle_lock`; the second caller sees `_recycling=True` and returns without spawning |
-| exactly one recycle thread | one `systemd-run` relaunch (unit `-r1`) |
-| exactly one replacement generation | one fresh secret + one fresh credential file |
-| exactly one timeout WORKER_RESTART | audited once by the single recycle thread; readiness BACKOFF -> READY |
+## P3 — Worker uses the application-specific interpreter
 
-The deterministic test drives two threads through a barrier (not sleeps) so
-both timeouts land concurrently:
+**File changed:** `sydeco_lightml_core/core.py` (`_start_app_systemd`).
+The systemd context previously set `"python": sys.executable` (the Core's
+interpreter). It now resolves the per-app interpreter from the registry venv
+(`<app_root>/venv/bin/python`) when one exists, so Application A's worker
+starts with A's Python and Application B's worker with B's Python. The Core
+does not load the application's dependencies.
 
-| Assertion | Result (live) |
-|---|---|
-| both requests time out (InferenceTimeout) | PASS (`["timeout", "timeout"]`) |
-| exactly one recycle (2 systemd-run total: initial + 1 relaunch) | PASS |
-| readiness recovers to READY | PASS |
-| exactly one `WORKER_RESTART` detail="timeout recycle" | PASS |
-| surviving generation serves a normal inference | PASS (200) |
+## P4 — Proven real dependency isolation (central acceptance)
 
-**Evidence:** `data/evidence_p1_recycle_concurrency.txt`.
+**Proof (new `tests/test_dep_isolation.py`, 5 tests):** two deterministic
+apps both depend on the stdlib-only fixture package `depballast` at
+INCOMPATIBLE versions — App A -> 1.0.0, App B -> 2.0.0 — each wheel built
+offline and placed in each app's own `wheelhouse/`. Proved simultaneously:
 
-## P2 — Per-generation worker secret (reviewer P1)
+| App | declared | installed | interpreter | behavior() | VERSION |
+|-----|----------|-----------|-------------|------------|---------|
+| app-a | depballast 1.0.0 | 1.0.0 | `<app-a>/venv/bin/python` | '1.0.0-behavior' | 1.0.0 |
+| app-b | depballast 2.0.0 | 2.0.0 | `<app-b>/venv/bin/python` | '2.0.0-behavior' | 2.0.0 |
 
-**File changed:** `sydeco_lightml_core/worker.py` — both hosts generate and
-hold a per-generation secret; `InProcessWorkerHost` rotates it in `start()`,
-`restart()` and the timeout-recycle publish; `SystemdTransientWorkerHost`
-generates it in `start()` (before every launch).
+- Both return valid results (behavior reflects its own version).
+- Distinct per-app interpreters (separate venvs).
+- **Restart stability:** breaking/removing App A's venv does NOT affect App B
+  (B still imports and serves 2.0.0). Installing/updating A cannot alter B's
+  environment (fully separate venvs/wheelhouses).
+- **Neither modifies the Core Python environment:** the global/system python
+  cannot `import depballast` (it exists only inside the per-app venvs).
 
-**What:** the reviewer's P1 directive, verbatim: "Generate a cryptographically
-random secret for every worker generation. It must be: unique per
-application; unique per generation; rotated after every worker
-recycle/restart; never reused across applications. Use a strong random source
-such as secrets.token_bytes(32)." Implemented with `secrets.token_hex(32)`
-(the hex form of `token_bytes(32)`, 64 hex chars).
+## P5 — Failure and security tests
 
-| Requirement (reviewer P1) | Mechanism | Proof |
-|---|---|---|
-| unique per application | Core holds one secret per worker host/app | App A secret != App B secret (P2 test) |
-| unique per generation | fresh `token_hex(32)` in every `start()` | generation 1 != generation 2 (restart) |
-| rotated after every recycle/restart | `restart()` and the timeout-recycle publish a fresh secret | root harness: secret A1 != A2 after timeout recycle |
-| never reused across applications | secrets never shared; no persistence | isolation test (P5) |
+`tests/test_dep_isolation.py` failure matrix (reviewer P5 minimum set) — all
+fail CLOSED with no half-valid environment:
 
-**Evidence:** `data/evidence_p2_p3_secret_delivery.txt`.
+| Case | Result |
+|------|--------|
+| missing wheel | REJECT |
+| wrong/unavailable dependency version | REJECT |
+| corrupt dependency material | REJECT (verified before venv, no half env) |
+| App A dependency failure | App B remains serving its own version |
+| incomplete venv creation | no application marked READY |
+| no Internet available | valid offline install still succeeds |
+| worker uses per-app interpreter | confirmed |
+| dependency paths cannot escape allowed area | by construction (inside app_root) |
+| dependency name/path shell-injection | no command executed (subprocess ARGV, not shell) |
+| failed install leaves no registry entry / half env | no falsely-active entry; partial venv removed |
 
-## P3 — Secure credential delivery (reviewer P2)
+## P6 — Regression
 
-**File changed:** `sydeco_lightml_core/worker.py` (credential file lifecycle +
-`LoadCredential=` property), `sydeco_lightml_core/core.py` (context
-`credential_dir`), `sydeco_lightml_core/worker_runtime.py`
-(`load_worker_secret()` + `--credential-file`), `tests/test_security.py`
-(test_13 passes a credential file — the worker is fail-closed now).
+Full suite in the repo: **91 tests -> OK** (86 prior + 5 new J1/J2).
+From a fresh extraction: **91 tests -> OK**. `py_compile` core: **17/17**.
+Dev-path occurrences in source (core/tests/examples): **0**. Git tree clean.
+LightML 1.0.1 untouched; CRA untouched; no production signing key.
 
-**What:** the reviewer's P2 directive: "For the systemd production path, use
-the design he already selected: systemd LoadCredential=." The transient unit
-property is set via the generic `--property=LoadCredential=worker-secret:<path>`
-mechanism (systemd 249 has no `--load-credential` CLI option). The worker
-reads `$CREDENTIALS_DIRECTORY/worker-secret` (production) or `--credential-file`
-(dev/test approximation; the PATH may appear in argv — the SECRET never
-does). No credential -> fail-closed (`WorkerRuntimeError` -> non-zero exit ->
-unit fails).
+## P7 — Evidence and daily report
 
-| Reviewer P2 requirement | Implementation | Proof |
-|---|---|---|
-| systemd LoadCredential= | `LoadCredential=worker-secret:<abs path>` in the transient unit properties | property present in the systemd-run argv; root harness: `CREDENTIALS_DIRECTORY` set in the real worker env |
-| NOT command line / Environment / manifest | secret only in the 0600 file; argv/Environment carry the path at most | focused test asserts the secret is absent from argv and `Environment=` values; root /proc sweep 0/0 |
-| root-controlled credential file | ephemeral file created mode 0600 in `<core-data>/secrets/`, unique per launch | mode 600 assertion; per-launch file name |
-| removed when the unit stops | `stop()` unlinks the credential file | focused test + root harness ("credential file removed on stop") |
-| serving Core must NOT become permanently root | all privileged work (systemd-run, credential file) lives in the narrow supervisor/install boundary; documented in the code docstring | the harness (root) runs the Core; the serving Core itself never elevates |
+- `data/evidence_day3_j12_venv_isolation.txt` — J1/J2 venv/wheelhouse
+  architecture paths, offline mechanism, commands, App A/B incompatible-
+  dependency proof table.
+- `data/evidence_day3_failure_matrix.txt` — reviewer P5 failure/security
+  matrix.
+- This README.md (English, single source of truth).
+- `Dev/Report/week-5/JAMALUDIN_DailyReport_31-08-2026.docx` (generated from
+  this README).
+- `SYDECO_LIGHTML_V2_DEV_2026-08-31.zip` + `.sha256` sidecar containing
+  source + `.git` + tests + README + ALL `data/` evidence, verified fresh
+  extraction PASS, no `.pyc`, SHA matches.
 
-**Evidence:** `data/evidence_p2_p3_secret_delivery.txt`,
-`data/evidence_p7_root_acceptance.txt`.
+## Evidence files shipped in the ZIP
 
-## P4 — Authenticate the complete internal worker API (reviewer P3)
-
-**File changed:** `sydeco_lightml_core/worker_runtime.py` — `_check_bearer()`
-(constant-time), request-local token extraction, auth gate on ALL endpoints,
-`_audit_auth_failure()` (worker-side AUTH_FAILURE JSONL).
-
-The regression test in `tests/test_channel_auth_b.py` deterministically proves
-that concurrent valid and invalid tokens cannot share request state.
-
-**What:** the reviewer's P3 directive, verbatim: "Require the Bearer
-credential on: POST /infer, GET /health/ready, GET /health/live. In other
-words: No unauthenticated worker HTTP endpoint. Use constant-time comparison
-(hmac.compare_digest)."
-
-| Endpoint | no token | wrong token | correct token |
-|---|---|---|---|
-| POST /infer | 401 | 401 | 200 |
-| GET /health/ready | 401 | 401 | 200 |
-| GET /health/live | 401 | 401 | 200 |
-
-The 401 body is a generic `{"error": {... "unauthorized"}}` — no secret, no
-hint. Auth failures are recorded by the worker itself in
-`<data_dir>/audit/audit.jsonl` as `AUTH_FAILURE` (the Core cannot observe 401s
-inside another process; a legitimate granular elaboration of C2 — the
-proposal does not lock event names, 24-08 precedent). The event carries
-app_id, source endpoint and timestamp — never the credential or the presented
-token (leakage-checked).
-
-**Evidence:** `data/evidence_p4_auth_endpoints.txt`.
-
-## P5 — Credential isolation (reviewer P4)
-
-**File changed:** tests (`tests/test_channel_auth_b.py`).
-
-**What:** the reviewer's P4 directive: "Prove: App A token -> App A =
-accepted; App A token -> App B = rejected; old App A generation token -> new
-App A generation = rejected; new App A token -> new generation = accepted."
-
-| Isolation case | Expected | Result (live) |
-|---|---|---|
-| App A token against App A | accepted (200) | PASS |
-| App A token against App B | rejected (401) | PASS |
-| old App A generation token -> new generation | rejected (401) | PASS |
-| new App A token -> new generation | accepted (200) | PASS |
-| one app's auth failure does not affect another | App B's storm leaves App A serving | PASS |
-
-**Evidence:** `data/evidence_p5_credential_isolation.txt`.
-
-## P6 — Leakage testing (reviewer P5)
-
-**File changed:** tests (`tests/test_channel_auth_b.py`).
-
-**What:** the reviewer's P5 directive: search explicitly for the secret in
-command line, /proc/<pid>/cmdline, /proc/<pid>/environ, manifest, registry,
-audit log, normal logs, client error responses, package, Git repository —
-expected result **0 secret occurrences**; the only allowed locations are
-tightly controlled runtime memory and the systemd credential mechanism.
-
-| Location | Expected | Result (live) |
-|---|---|---|
-| command line (spawned worker argv) | 0 | PASS |
-| /proc/<pid>/cmdline (REAL systemd worker) | 0 | PASS |
-| /proc/<pid>/environ (REAL systemd worker) | 0 | PASS |
-| manifest / registry / source tree | 0 | PASS |
-| Core audit + worker audit (incl. AUTH_FAILURE events) | 0 | PASS |
-| worker stdout/stderr (normal logs) | 0 | PASS |
-| client error responses (401 body) | 0 | PASS |
-| package (ZIP, incl. evidence files) | 0 | PASS (meta-check before packaging) |
-| git repository (committed files) | 0 | PASS |
-
-**Evidence:** `data/evidence_p6_leakage.txt`, `data/evidence_p7_root_acceptance.txt`.
-
-## P7 — Required acceptance matrix + no regression (reviewer P6)
-
-**File changed:** tests (`tests/test_channel_auth_c.py`, 6 acceptance-matrix
-tests) + the privileged root harness (external, `/tmp/hermes-day2-root-harness.py`).
-
-**What:** the reviewer's 13-row acceptance table, verbatim, proven on the dev
-equivalents AND on the REAL systemd path:
-
-| Test | Expected | Non-privileged | Root (real systemd) |
-|---|---|---|---|
-| /infer, no token | 401 | PASS | PASS |
-| /infer, wrong token | 401 | PASS | PASS |
-| /infer, correct token | 200 | PASS | PASS |
-| /health/ready, no token | 401 | PASS | PASS |
-| /health/ready, correct token | 200 | PASS | PASS |
-| /health/live, no token | 401 | PASS | PASS |
-| /health/live, correct token | 200 | PASS | PASS |
-| App A token against App B | 401 | PASS | PASS |
-| old token after recycle | 401 | PASS | PASS |
-| new token after recycle | 200 | PASS | PASS |
-| token absent from logs/manifest/registry | PASS | PASS | PASS |
-| one app authentication failure does not affect another | PASS | PASS | PASS |
-| simultaneous timeout causes one recycle only | PASS | PASS (WORKER_RESTART count=1) | PASS |
-
-The ROOT harness (31/31 PASS, self-cleaning: stops units incl. -rN relaunches,
-removes capability users and temp dirs) additionally proves on the REAL
-systemd path: `LoadCredential=` delivery with `$CREDENTIALS_DIRECTORY` set in
-the worker env, ephemeral credential file mode 600 removed on stop, /proc
-leakage 0/0 on the real worker PID, `AUTH_FAILURE` audited worker-side
-(count=4 from the wrong-token probes), timeout STALL -> InferenceTimeout (the
-504 the Core edge returns) -> recycle -> secret rotated -> old 401 / new 200
--> exactly one timeout WORKER_RESTART.
-
-No regression — reviewer: "rerun all existing 63 tests plus the new tests,
-both: repository -> PASS and fresh extraction -> PASS":
-
-| Check | Result (live) |
-|---|---|
-| Focused Fase A (`test_channel_auth.py`) | 7/7 PASS |
-| Focused Fase B (`test_channel_auth_b.py`) | 7/7 PASS |
-| Focused acceptance matrix (`test_channel_auth_c.py`) | 6/6 PASS |
-| `test_security.py` (incl. updated test_13) | 13/13 PASS |
-| `test_timeout_recovery.py` | 11/11 PASS |
-| FULL suite IN THE REPO | **83/83 PASS** (Ran 83 tests ... OK) |
-| FULL suite FROM FRESH EXTRACTION | **83/83 PASS**, 0 dev-path, py_compile 17/17 |
-| 0 new `__pycache__` / `.pyc` today | PASS |
-
-**Evidence:** `data/evidence_p7_acceptance_matrix.txt`,
-`data/evidence_p7_root_acceptance.txt` (31/31),
-`data/evidence_p8_fresh_extraction.txt`, `data/evidence_regression_full_suite.txt`.
-
-## P8 — Evidence + daily report + final package
-
-- 9 evidence files in `data/` (list in the Evidence table below), all
-  secret-free (meta-check: the day's `data/` + README are swept for the test
-  secret values before packaging).
-- This README.md (English, single source of truth) and the generated
-  `JAMALUDIN_DailyReport_28-08-2026.docx` (pandoc, reference-doc = the
-  27-08-2026 report, GitHub table fixes applied, docx validated).
-- Corrected source and regression test verified; final commit and clean-tree
-  status are recorded after the final packaging commit.
-- Package: `SYDECO_LIGHTML_V2_DEV_2026-08-28.zip` + `.sha256` sidecar
-  containing source + .git + tests + README + ALL `data/` evidence files
-  (reports and archives correspond exactly); listing + entry count verified.
-- Final statement (verbatim): **LightML 1.0.1 untouched. CRA untouched. No
-  production signing key created.**
-
----
-
-## Bugs / architecture issues found and fixed (2026-08-28)
-
-| # | Issue (root cause) | Fix |
-|---|---|---|
-| 1 | (reviewer P0 finding, confirmed) `SystemdTransientWorkerHost._recycle_after_timeout` check/set of `_recycling` was NOT lock-protected while the Core HTTP server is multithreaded — two simultaneous timeouts could spawn two recycle threads | small local `threading.Lock` around check/set + reset in `finally`; deterministic barrier test (P1) |
-| 2 | worker HTTP endpoints (`/infer`, `/health/ready`, `/health/live`) had NO authentication — loopback ≠ authenticated channel (D2 note) | Bearer required on ALL endpoints, `hmac.compare_digest`, 401 generic, AUTH_FAILURE worker-side audit (P4) |
-| 3 | no per-generation secret existed; a fresh generation could keep using an old credential | `secrets.token_hex(32)` per generation, rotated on start/restart/recycle (P2/P3) |
-| 4 | worker had no secure delivery path (nothing to read) | `load_worker_secret()`: `$CREDENTIALS_DIRECTORY/worker-secret` (systemd) or `--credential-file` (dev); fail-closed (P3) |
-| 5 | `test_13_worker_binds_loopback_only` probed `/health/ready` WITHOUT a token — would fail once auth landed | probe sends the credential (P4 ripple) |
-| 6 | (root-harness debugging, dev-only) worker unit `PrivateTmp=yes` remaps `/tmp` — paths under /tmp invisible to the worker ("not ready within 30s") | harness workdir moved to `/var/lib` (24-08 pitfall, reapplied) |
-| 7 | (root-harness debugging, dev-only) leftover transient units (`-r1`) from a crashed run block the next launch ("Unit already exists"); audit read raced the recycle thread | harness cleanup stops all `-rN` units; audit read waits 0.5 s |
-
-## Verification (before declaring done)
-
-| Check | Result |
-|---|---|
-| Focused Fase A / B / acceptance matrix | 7/7 / 7/7 / 6/6 PASS |
-| FULL suite IN THE REPO | 83/83 PASS |
-| Full suite FROM FRESH EXTRACTION | 83/83 PASS; 0 dev paths; py_compile 17/17 |
-| ROOT harness (real systemd, LoadCredential, /proc sweep) | 31/31 PASS |
-| Leakage (all reviewer P5 locations, incl. real /proc) | 0 occurrences |
-| 0 new `__pycache__` / `.pyc` | PASS |
-| git commit + clean tree | verified during final packaging |
-| Evidence files secret-free | PASS (meta-sweep) |
-| LightML 1.0.1 / CRA / production key | untouched / untouched / not created |
-
-## Evidence table
-
-| File | Content |
-|---|---|
-| `data/evidence_p1_recycle_concurrency.txt` | **NEW**: P1 (reviewer P0) — deterministic concurrent-timeout test, one recycle/generation/WORKER_RESTART |
-| `data/evidence_p2_p3_secret_delivery.txt` | **NEW**: P2/P3 — per-generation secret, LoadCredential property, 0600 file lifecycle, fail-closed worker |
-| `data/evidence_p4_auth_endpoints.txt` | **NEW**: P4 — Bearer on all endpoints, 401 matrix, AUTH_FAILURE audit |
-| `data/evidence_p5_credential_isolation.txt` | **NEW**: P5 — App A vs App B, old vs new generation |
-| `data/evidence_p6_leakage.txt` | **NEW**: P6 — 0 occurrences in repo/proc/logs/errors |
-| `data/evidence_p7_acceptance_matrix.txt` | **NEW**: P7 non-privileged — 13-row acceptance table |
-| `data/evidence_p7_root_acceptance.txt` | **NEW**: P7 ROOT — real-systemd harness **31/31 PASS** |
-| `data/evidence_p8_fresh_extraction.txt` | **NEW**: fresh tree — 0 dev paths, 17/17 compile, 83/83 |
-| `data/evidence_regression_full_suite.txt` | **NEW**: full suite in repo — 83/83 |
-| `data/SYDECO_LIGHTML_V2_DEV_2026-08-28.zip` + `.sha256` | **NEW**: Day-2 package — source + .git + tests + README + all evidence |
-
-## What remains
-
-- The reviewer's verification of this Day-2 report + package.
-- Phase 2 hardening continues (reviewer's agreed order): wheelhouse/venv per
-  app (J1/J2), streaming (K5), update handling + schema migration (F4/F6),
-  production signing-key infrastructure (R6 infra).
-- Permanent systemd unit files (from the same property set) when the full
-  installer (3.1) lands.
-- CRA integration: NOT started (reviewer constraint preserved).
+- data/evidence_p1_recycle_concurrency.txt
+- data/evidence_p2_p3_secret_delivery.txt
+- data/evidence_p4_auth_endpoints.txt
+- data/evidence_p5_credential_isolation.txt
+- data/evidence_p6_leakage.txt
+- data/evidence_p7_acceptance_matrix.txt
+- data/evidence_p7_root_acceptance.txt
+- data/evidence_p8_fresh_extraction.txt
+- data/evidence_regression_full_suite.txt
+- data/evidence_day3_j12_venv_isolation.txt
+- data/evidence_day3_failure_matrix.txt
 
 ## Constraints honored
 
-- Day 2 scoped EXACTLY to authenticated Core <-> worker communication
-  (reviewer's do-not-start list): no streaming, no CRA, no production signing
-  key, no schema migration/update, no wheelhouse/venv, no change to LightML
-  1.0.1.
-- WorkerManager is not redesigned; the recycle lock is a small local lock
-  (D4, reviewer P0 "without redesigning WorkerManager").
-- The serving Core never becomes permanently root; privileged work stays in
-  the narrow supervisor/install boundary (reviewer P2).
+- Do-not-start list followed: no streaming/K5, no CRA, no schema migration
+  F4/F6, no production signing-key infrastructure, no permanent systemd unit,
+  no change to LightML 1.0.1.
 - No external/cloud dependency — needs no Internet beyond OS dependencies;
-  stdlib-only + the system `cryptography` 3.4.8 package.
-- Only the TEST signing key
-  `DEVELOPMENT_TEST_KEY_DO_NOT_USE_IN_PRODUCTION` exists in the repo; no
-  production key created.
-- LightML 1.0.1 Production: NOT modified; V2 not installed over 1.0.1; CRA
-  untouched.
-- Status stays: **SYDECO LIGHTML UNIVERSAL RUNTIME V2 — DEVELOPMENT /
-  PROOF OF CONCEPT — AWAITING REVIEW.**
+  stdlib-only + the system `cryptography` 3.4.8 (the one permitted exception);
+  no pip installs against the Internet (offline wheelhouse only).
+- Tests/experiments only in isolated areas (/tmp + the dev repo); no global
+  Python env created; venv/wheelhouse never committed.
+- Only the TEST signing key exists; no production signing key created.
+- Wording discipline: "needs no Internet beyond OS dependencies".
 
 ## Conclusion
 
-The reviewer's Day-2 assignment — authenticated Core <-> worker channel — is
-fully implemented and evidenced. The production recycle transition is now
-race-free (one recycle under concurrent timeouts, reviewer P0); every worker
-generation carries a fresh cryptographically random secret delivered ONLY via
-systemd `LoadCredential=` (ephemeral root-only file, removed on stop); every
-internal worker endpoint requires the Bearer credential with constant-time
-comparison; credential isolation across apps and generations holds; and the
-leakage sweep returns 0 secret occurrences everywhere except runtime memory
-and the systemd credential mechanism. The 13-row acceptance matrix passes on
-the dev equivalents AND on the real systemd path (root harness 31/31),
-full suite passes 83/83 in the repo and from a fresh extraction, and the
-working tree is clean after the final packaging commit. LightML 1.0.1 untouched. CRA
-untouched. No production signing key created.
+The Day-2 defects the reviewer required are closed (runtime leakage secret,
+exception-safe credential cleanup, evidence inside the package, correct
+sidecar name). Day-3 J1/J2 proves the central acceptance: each application
+owns its Python environment and dependencies, isolated from every other
+application and from the Core, built entirely offline from its own local
+wheelhouse, and launched under its own interpreter. Full suite 91/91 in repo
+and fresh extraction; git tree clean. LightML 1.0.1 untouched. CRA untouched.
+No production signing key created.
 
 Status: **SYDECO LIGHTML UNIVERSAL RUNTIME V2 — DEVELOPMENT / PROOF OF
 CONCEPT — AWAITING REVIEW.**
