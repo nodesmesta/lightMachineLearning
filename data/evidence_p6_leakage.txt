@@ -1,0 +1,15 @@
+# evidence_p6_leakage.txt
+Date: 2026-08-28T11:21:53+07:00
+Repo: /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV
+
+## Summary
+Leakage sweep (reviewer P5): the secret value appears 0 times in command line, /proc/<pid>/cmdline, /proc/<pid>/environ, manifest, registry, audit logs (Core + worker), normal logs, client error responses, the package tree and the git repository. Tests 06-07 of test_channel_auth_b.py (non-privileged part); the REAL systemd /proc sweep is in evidence_p7_root_acceptance.txt.
+
+## Live output
+```
+.......
+----------------------------------------------------------------------
+Ran 7 tests in 7.038s
+
+OK
+```

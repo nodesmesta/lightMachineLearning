@@ -1,0 +1,40 @@
+=== Phase 2 / Day 2 ROOT harness (20260828-111923) ===
+cwd repo: /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV
+leftover units cleaned
+repo copied to /var/lib/sydeco-root-20260828-111923/repo
+capability users will be provisioned by Core at install
+bundles signed: /var/lib/sydeco-root-20260828-111923/apps/rootapp-a /var/lib/sydeco-root-20260828-111923/apps/rootapp-b
+  [PASS] install app A app registered: rootapp-a v1.0.0
+  [PASS] install app B app registered: rootapp-b v1.0.0
+  [PASS] start app A (systemd) app started: rootapp-a v1.0.0
+  [PASS] secret A1 generated 
+  [PASS] credential file mode 600 
+  [PASS] worker A ready (auth) 
+  [PASS] start app B (systemd) app started: rootapp-b v1.0.0
+  [PASS] secret B unique 
+  [PASS] worker B ready (auth) 
+  [PASS] /infer no token -> 401 
+  [PASS] /infer wrong token -> 401 
+  [PASS] /infer correct token -> 200 
+  [PASS] /health/ready no token -> 401 
+  [PASS] /health/ready correct -> 200 
+  [PASS] /health/live no token -> 401 
+  [PASS] /health/live correct -> 200 
+  [PASS] App A token against App B -> 401 
+  [PASS] worker MainPID found pid=23345
+  [PASS] 0 secret in /proc cmdline 
+  [PASS] 0 secret in /proc environ 
+  [PASS] CREDENTIALS_DIRECTORY set 
+  [PASS] AUTH_FAILURE audited worker-side count=4
+  [PASS] timeout STALL -> InferenceTimeout (504 upstream) got InferenceTimeout
+  [PASS] secret rotated after recycle 
+  [PASS] replacement worker ready (new secret) 
+  [PASS] old token after recycle -> 401 
+  [PASS] new token after recycle -> 200 
+  [PASS] exactly one timeout WORKER_RESTART count=1
+  [PASS] app B unaffected -> 200 
+  [PASS] credential file removed on stop 
+  [PASS] app B stopped 
+cleanup done; work dir removed
+
+=== ROOT HARNESS RESULT: 31 PASS / 0 FAIL ===

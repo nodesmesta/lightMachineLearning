@@ -30,6 +30,7 @@ import hashlib
 import http.client
 import json
 import os
+import secrets
 import shutil
 import socket
 import subprocess
@@ -209,7 +210,10 @@ class AcceptanceMatrixTests(unittest.TestCase):
                     gen2.kill()
 
     def test_04_token_absent_from_logs_manifest_registry(self) -> None:
-        secret = "d1" * 32
+        # P0 day-2 closure (reviewer P0-1): the leakage-scan secret must be
+        # runtime-generated so compiled bytecode can never embed it and be
+        # reported as a false leakage.
+        secret = secrets.token_hex(32)
         cred = os.path.join(self._tmp, "cred")
         with open(cred, "w", encoding="utf-8") as fh:
             fh.write(secret + "\n")

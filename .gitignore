@@ -5,8 +5,10 @@ __pycache__/
 .venv/
 venv/
 
-# Local dev data (registry, audit, etc.) — NOT versioned
-data/
+# Local dev data (registry, audit, etc.) — NOT versioned.
+# Evidence files (data/evidence_*.txt) ARE versioned so the delivered
+# package corresponds to the final commit (reviewer P0, 2026-08-28).
+data/registry/
 
 # OS
 .DS_Store

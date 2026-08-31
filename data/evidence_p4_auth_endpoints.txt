@@ -1,0 +1,15 @@
+# evidence_p4_auth_endpoints.txt
+Date: 2026-08-28T11:21:53+07:00
+Repo: /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV
+
+## Summary
+The worker REQUIRES the Bearer credential on ALL internal endpoints (POST /infer, GET /health/ready, GET /health/live) — no unauthenticated worker endpoint (reviewer P3). Constant-time hmac.compare_digest; unauthenticated/wrong/foreign -> 401 generic; correct -> 200. Auth failures are audited worker-side (AUTH_FAILURE in the worker's own data-dir audit JSONL — C2 elaboration). Tests 01-03 of test_channel_auth_b.py, including the deterministic concurrent mixed-token regression test.
+
+## Live output
+```
+.......
+----------------------------------------------------------------------
+Ran 7 tests in 7.038s
+
+OK
+```

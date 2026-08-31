@@ -25,6 +25,7 @@ import hashlib
 import http.client
 import json
 import os
+import secrets
 import shutil
 import socket
 import subprocess
@@ -323,7 +324,12 @@ class ChannelAuthFaseBTests(unittest.TestCase):
         """P6 non-privileged sweep: manifest, registry, Core audit, worker
         audit, logs, client error responses, package tree, git repo."""
         app_root = os.path.join(REPO, "examples", "text-classifier")
-        secret = "99" * 32
+        # P0 Day-2 closure (reviewer P0-1): the leakage-test credential is
+        # generated DYNAMICALLY at runtime (secrets.token_hex(32)) so Python
+        # bytecode (__pycache__/*.pyc) can never embed a deterministic test
+        # secret and be reported as a false leakage. Reproducible under any
+        # interpreter / pyc state.
+        secret = secrets.token_hex(32)
         cred_file = os.path.join(self._tmp, "worker-secret")
         with open(cred_file, "w", encoding="utf-8") as fh:
             fh.write(secret + "\n")
@@ -363,7 +369,7 @@ class ChannelAuthFaseBTests(unittest.TestCase):
         """P6 root harness will do the real /proc sweep; this non-privileged
         version proves the SPAWNED worker's argv/environ carry no secret."""
         app_root = os.path.join(REPO, "examples", "text-classifier")
-        secret = "77" * 32
+        secret = secrets.token_hex(32)
         cred_file = os.path.join(self._tmp, "worker-secret")
         with open(cred_file, "w", encoding="utf-8") as fh:
             fh.write(secret + "\n")

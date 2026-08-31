@@ -1,0 +1,97 @@
+# evidence_p8_fresh_extraction.txt
+Date: 2026-08-31T10:35:00
+Repo: /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV
+
+## Summary
+Full suite from a FRESH extraction (no .git, no __pycache__): 0 /home/sydeco
+dev-path occurrences in source (sydeco_lightml_core/, tests/, examples/),
+all 17 core modules py_compile, complete suite 86/86 PASS (reviewer: 'rerun
+all existing 63 tests plus the new tests, both repository -> PASS and fresh
+extraction -> PASS'; day-2 closure adds 3 credential-lifecycle tests).
+
+## Live output
+```
+fresh tree: /tmp/hermes-fresh-e7nEbX/repo
+dev-path (/home/sydeco) occurrences in fresh tree: 0
+py_compile core modules: 17 -> OK
+....................----------------------------------------
+Exception occurred during processing of request from ('127.0.0.1', 33458)
+----------------------------------------
+Exception occurred during processing of request from ('127.0.0.1', 33468)
+Traceback (most recent call last):
+Traceback (most recent call last):
+  File "/usr/lib/python3.10/socketserver.py", line 683, in process_request_thread
+    self.finish_request(request, client_address)
+  File "/usr/lib/python3.10/socketserver.py", line 683, in process_request_thread
+    self.finish_request(request, client_address)
+  File "/usr/lib/python3.10/socketserver.py", line 360, in finish_request
+    self.RequestHandlerClass(request, client_address, self)
+  File "/usr/lib/python3.10/socketserver.py", line 360, in finish_request
+    self.RequestHandlerClass(request, client_address, self)
+  File "/usr/lib/python3.10/socketserver.py", line 747, in __init__
+    self.handle()
+  File "/usr/lib/python3.10/http/server.py", line 435, in handle
+    self.handle_one_request()
+  File "/usr/lib/python3.10/http/server.py", line 411, in handle_one_request
+    if not self.parse_request():
+  File "/usr/lib/python3.10/socketserver.py", line 747, in __init__
+    self.handle()
+  File "/usr/lib/python3.10/http/server.py", line 328, in parse_request
+    self.send_error(
+  File "/usr/lib/python3.10/http/server.py", line 435, in handle
+    self.handle_one_request()
+  File "/usr/lib/python3.10/http/server.py", line 488, in send_error
+    self.wfile.write(body)
+  File "/usr/lib/python3.10/socketserver.py", line 826, in write
+    self._sock.sendall(b)
+  File "/usr/lib/python3.10/http/server.py", line 411, in handle_one_request
+    if not self.parse_request():
+BrokenPipeError: [Errno 32] Broken pipe
+----------------------------------------
+  File "/usr/lib/python3.10/http/server.py", line 328, in parse_request
+    self.send_error(
+  File "/usr/lib/python3.10/http/server.py", line 488, in send_error
+    self.wfile.write(body)
+  File "/usr/lib/python3.10/socketserver.py", line 826, in write
+    self._sock.sendall(b)
+BrokenPipeError: [Errno 32] Broken pipe
+----------------------------------------
+.infer failed for fail-inferraise
+Traceback (most recent call last):
+  File "/tmp/sydeco-fresh-wzz4zpzh/repo/sydeco_lightml_core/server.py", line 287, in _handle_infer
+    result_obj = {"result": host.infer(items[0], request_id)}
+  File "/tmp/sydeco-fresh-wzz4zpzh/repo/sydeco_lightml_core/worker.py", line 214, in infer
+    result = future.result(timeout=self._timeout)
+  File "/usr/lib/python3.10/concurrent/futures/_base.py", line 451, in result
+    return self.__get_result()
+  File "/usr/lib/python3.10/concurrent/futures/_base.py", line 403, in __get_result
+    raise self._exception
+  File "/usr/lib/python3.10/concurrent/futures/thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+  File "/tmp/sydeco-fail-p8t0a9hl/fail-inferraise/adapter/main.py", line 5, in infer
+    raise ValueError('boom-infer')
+ValueError: boom-infer
+....output schema violation for fail-wrongout: ["result: missing required field 'ok'"]
+.................infer failed for image-classifier
+Traceback (most recent call last):
+  File "/tmp/sydeco-fresh-wzz4zpzh/repo/sydeco_lightml_core/server.py", line 287, in _handle_infer
+    result_obj = {"result": host.infer(items[0], request_id)}
+  File "/tmp/sydeco-fresh-wzz4zpzh/repo/sydeco_lightml_core/worker.py", line 214, in infer
+    result = future.result(timeout=self._timeout)
+  File "/usr/lib/python3.10/concurrent/futures/_base.py", line 451, in result
+    return self.__get_result()
+  File "/usr/lib/python3.10/concurrent/futures/_base.py", line 403, in __get_result
+    raise self._exception
+  File "/usr/lib/python3.10/concurrent/futures/thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+  File "/tmp/sydeco-pocb-gdsi41gh/bundle/adapter/main.py", line 24, in infer
+    pixels = self._parse_pgm(raw)
+  File "/tmp/sydeco-pocb-gdsi41gh/bundle/adapter/main.py", line 35, in _parse_pgm
+    raise ValueError("unsupported image format (expected PGM P5)")
+ValueError: unsupported image format (expected PGM P5)
+.........................................
+----------------------------------------------------------------------
+Ran 86 tests in 50.105s
+
+OK
+```

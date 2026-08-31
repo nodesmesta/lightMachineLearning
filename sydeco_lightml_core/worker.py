@@ -522,6 +522,21 @@ class SystemdTransientWorkerHost(WorkerHost):
 
     # ---- lifecycle -----------------------------------------------------
 
+    def _remove_credential(self) -> None:
+        """Idempotent P3 cleanup: always delete the ephemeral credential
+        file if one was created, then forget it. Called from stop() on
+        EVERY path (including when _started is False) and from start()
+        on every FAILED launch path (reviewer P0-2: every credential file
+        must disappear after successful stop AND after every failed
+        launch/start path). Best-effort — OSError is swallowed so a
+        missing file never masks the lifecycle result."""
+        if self._credential_path is not None:
+            try:
+                os.unlink(self._credential_path)
+            except OSError:
+                pass
+            self._credential_path = None
+
     def start(
         self,
         app_id: str,
@@ -641,12 +656,19 @@ class SystemdTransientWorkerHost(WorkerHost):
             + [f"--property={p}" for p in props]
             + ["--", *cmd]
         )
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"systemd-run failed for {app_id}: "
-                f"{(proc.stderr or proc.stdout).strip()}"
-            )
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"systemd-run failed for {app_id}: "
+                    f"{(proc.stderr or proc.stdout).strip()}"
+                )
+        except BaseException:
+            # P0-2 (reviewer): a FAILED launch MUST still clean up the
+            # ephemeral credential file -- _started is still False here so
+            # stop() would otherwise return without unlinking it.
+            self._remove_credential()
+            raise
         self._started = True
         self._ready = False
         self._last_nrestarts = 0
@@ -654,11 +676,24 @@ class SystemdTransientWorkerHost(WorkerHost):
         self._pids_flagged = False
         self._oom_checked = False
         self._start_monitor()
-        if not self._wait_ready():
-            self._audit_event("WORKER_CRASH", detail="worker not ready within wait")
-            raise RuntimeError(
-                f"worker {app_id} not ready within {self._ready_wait:.0f}s"
-            )
+        try:
+            if not self._wait_ready():
+                self._audit_event("WORKER_CRASH", detail="worker not ready within wait")
+                raise RuntimeError(
+                    f"worker {app_id} not ready within {self._ready_wait:.0f}s"
+                )
+        except BaseException:
+            # P0-2 (reviewer): a worker that launches but never becomes ready
+            # must also have its credential removed.
+            self._remove_credential()
+            # The transient unit was created; stop it so no orphan worker
+            # keeps running. _started is True, so stop() does the full
+            # systemctl stop + credential cleanup.
+            try:
+                self.stop(app_id)
+            except BaseException:
+                pass
+            raise
         self._ready = True
 
     def stop(self, app_id: str) -> None:
@@ -666,6 +701,11 @@ class SystemdTransientWorkerHost(WorkerHost):
         import subprocess
 
         self._stop_monitor()
+        # P0-2 (reviewer): the credential file is ALWAYS cleaned up, even
+        # when the host was never _started (e.g. a failed launch). Previously
+        # this cleanup was after the `if not self._started: return` guard, so
+        # a failed launch could leave a root-only 0600 credential file behind.
+        self._remove_credential()
         if not self._started:
             return
         unit = self._unit + ".service"
@@ -682,14 +722,6 @@ class SystemdTransientWorkerHost(WorkerHost):
                 ["systemctl", "kill", "-s", "SIGKILL", unit],
                 capture_output=True, text=True, timeout=30,
             )
-        # P3: the ephemeral credential file is removed when the unit stops
-        # (best-effort; the unit already stopped, nothing reads it anymore).
-        if self._credential_path is not None:
-            try:
-                os.unlink(self._credential_path)
-            except OSError:
-                pass
-            self._credential_path = None
         self._started = False
         self._ready = False
         if self._readiness is not None:
