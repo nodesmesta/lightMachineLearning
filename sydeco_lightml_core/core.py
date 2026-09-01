@@ -14,10 +14,13 @@ added via start_app/stop_app/serve.
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import logging
 import os
 import shutil
+import subprocess
 import sys
+import zipfile
 from typing import Any, Dict, List, Optional, Tuple
 
 from .audit import JsonlAuditBackend
@@ -35,6 +38,21 @@ from .worker import (
     WorkerManager,
     allocate_port,
 )
+
+
+def _resolve_within_app_root(app_root: str, *parts: str, label: str) -> str:
+    """Resolve a path and reject fail-closed if it escapes the app root.
+
+    Reapplies the N2-style containment discipline to J1/J2 dependency and venv
+    paths: resolve first, then decide containment with realpath/commonpath.
+    """
+    root = os.path.realpath(os.path.abspath(app_root))
+    path = os.path.realpath(
+        os.path.abspath(os.path.normpath(os.path.join(root, *parts)))
+    )
+    if os.path.commonpath([root, path]) != root:
+        raise RuntimeError(f"install rejected: {label} escapes app root: {path}")
+    return path
 
 
 class CoreService:
@@ -309,18 +327,46 @@ class CoreService:
         version. Wording (standing): needs no Internet beyond OS
         dependencies.
         """
+        app_root = os.path.realpath(os.path.abspath(app_root))
         filesystem_paths: Dict[str, str] = {"app_root": app_root}
         deps = manifest.get("dependencies", [])
+        wheelhouse_raw = os.path.join(app_root, "wheelhouse")
+        venv_dir = _resolve_within_app_root(app_root, "venv", label="venv path")
+        filesystem_paths["venv"] = venv_dir
+        if os.path.lexists(wheelhouse_raw):
+            wheelhouse = _resolve_within_app_root(
+                app_root, "wheelhouse", label="wheelhouse path"
+            )
+        else:
+            wheelhouse = wheelhouse_raw
         if not deps:
-            # J1 keeps a per-app venv only for apps that declare dependency
-            # isolation needs; an app with no dependencies has no wheelhouse
-            # to build from (proposal J2: dependencies absent => no wheels).
+            # J1 requires an isolated interpreter for every application,
+            # including apps with no Python dependencies. Such an app must
+            # not carry undeclared dependency material in its bundle (J4).
+            if os.path.isdir(wheelhouse) and any(
+                fn.endswith((".whl", ".tar.gz"))
+                for fn in os.listdir(wheelhouse)
+            ):
+                raise RuntimeError(
+                    f"install rejected: dependency material present for "
+                    f"dependency-free app {app_id}"
+                )
+            try:
+                subprocess.run(
+                    ["python3", "-m", "venv", venv_dir],
+                    capture_output=True, text=True, check=True, timeout=120,
+                )
+                py = os.path.join(venv_dir, "bin", "python")
+                if not os.path.isfile(py):
+                    raise RuntimeError(
+                        f"install rejected: venv missing interpreter: {py}"
+                    )
+            except BaseException:
+                if os.path.isdir(venv_dir):
+                    shutil.rmtree(venv_dir, ignore_errors=True)
+                raise
             return filesystem_paths
 
-        import subprocess
-
-        wheelhouse = os.path.join(app_root, "wheelhouse")
-        venv_dir = os.path.join(app_root, "venv")
         filesystem_paths["wheelhouse"] = wheelhouse
         filesystem_paths["venv"] = venv_dir
 
@@ -334,6 +380,9 @@ class CoreService:
         declared = {(d["name"], d.get("version")) for d in deps}
         have_wheels = set()
         for fn in sorted(os.listdir(wheelhouse)):
+            wp = _resolve_within_app_root(
+                app_root, "wheelhouse", fn, label=f"dependency file {fn}"
+            )
             # wheelhouse entries are .whl (or .tar.gz for sdist fallback).
             # Extract (name, version-ish) from the wheel filename, e.g.
             #   depballast_a-2.0.0-py3-none-any.whl  -> ('depballast-a','2.0.0')
@@ -357,11 +406,11 @@ class CoreService:
             # Verify dependency material integrity up front (existing
             # trust/integrity architecture, J2/J4): a corrupted/mis-named wheel
             # is REJECTED here, before any venv is built.
-            import zipfile
-
             for fn in sorted(os.listdir(wheelhouse)):
                 if fn.endswith(".whl"):
-                    wp = os.path.join(wheelhouse, fn)
+                    wp = _resolve_within_app_root(
+                        app_root, "wheelhouse", fn, label=f"dependency file {fn}"
+                    )
                     try:
                         with zipfile.ZipFile(wp) as zf:
                             if zf.testzip() is not None:
@@ -416,8 +465,6 @@ class CoreService:
         """
         if self.worker_mode != "systemd":
             return None
-        import subprocess
-
         user = f"sydeco-cap-{app_id}"
         proc = subprocess.run(
             ["useradd", "-r", "-M", "-s", "/usr/sbin/nologin", user],
@@ -467,8 +514,6 @@ class CoreService:
         os.chmod(app_data_dir, 0o755)
         if self.worker_mode == "systemd":
             try:
-                import subprocess
-
                 subprocess.run(
                     ["chown", "-R", f"sydeco-cap-{app_id}:sydeco-cap-{app_id}",
                      app_data_dir],
@@ -480,15 +525,23 @@ class CoreService:
             "SYDECO_LIGHTML_WORKER_REPO",
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         )
-        # J1/J2/P3 (proposal 2.4): the worker uses the APP'S OWN interpreter
-        # (per-app venv) when it has one; otherwise it falls back to the
-        # Core's sys.executable (apps with no declared dependencies). Never
-        # does the Core load the application's Python dependencies.
-        app_python = sys.executable
-        if venv:
-            candidate = os.path.join(venv, "bin", "python")
-            if os.path.isfile(candidate):
-                app_python = candidate
+        # J1/J2/P3 (proposal 2.4): every application/version owns its own venv
+        # and the worker MUST use that interpreter. Missing/broken/outside-app
+        # venv paths fail closed; no silent fallback to the Core Python.
+        app_root = os.path.realpath(os.path.abspath(app_root))
+        if not venv:
+            return False, f"start rejected: app {app_id} has no dedicated venv", None
+        try:
+            venv = _resolve_within_app_root(app_root, os.path.relpath(venv, app_root), label="venv path")
+        except ValueError:
+            return False, f"start rejected: venv path escapes app root: {venv}", None
+        candidate = _resolve_within_app_root(
+            app_root, os.path.relpath(os.path.join(venv, "bin", "python"), app_root),
+            label="venv interpreter",
+        )
+        if not os.path.isfile(candidate):
+            return False, f"start rejected: venv interpreter missing: {candidate}", None
+        app_python = candidate
         context: Dict[str, Any] = {
             "app_root": app_root,
             "config": manifest,
@@ -678,7 +731,6 @@ class CoreService:
 
 
 def _sha256_file(path: str) -> str:
-    import hashlib
     h = hashlib.sha256()
     with open(path, "rb") as fh:
         for chunk in iter(lambda: fh.read(65536), b""):
