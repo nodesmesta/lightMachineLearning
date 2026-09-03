@@ -193,6 +193,10 @@ class WorkerHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_ndjson_data(self, obj: Any) -> None:
+        self.wfile.write(json.dumps({"data": obj}).encode("utf-8") + b"\n")
+        self.wfile.flush()
+
     def _error(self, code: int, message: str) -> None:
         self._send_json(code, {"error": {"code": str(code), "message": message}})
 
@@ -225,7 +229,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
-        if path != "/infer":
+        if path not in ("/infer", "/stream"):
             self._error(404, "unknown endpoint")
             return
         runtime = getattr(self.server, "runtime")
@@ -262,10 +266,29 @@ class WorkerHandler(BaseHTTPRequestHandler):
             context = dict(runtime.context)
             context["request_id"] = runtime.request_id()
             try:
+                if path == "/stream":
+                    stream_fn = getattr(runtime.adapter, "stream", None)
+                    if stream_fn is None:
+                        self._error(400, "streaming not supported by app")
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/x-ndjson")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    for chunk in stream_fn(request, context):
+                        self._send_ndjson_data(chunk)
+                    self.close_connection = True
+                    return
                 result = runtime.adapter.infer(request, context)
             except Exception:
-                log.exception("adapter.infer failed")
-                self._error(500, "internal error")
+                log.exception("adapter.%s failed", "stream" if path == "/stream" else "infer")
+                if path == "/stream":
+                    try:
+                        self._send_ndjson_data({"error": "internal error"})
+                    except Exception:
+                        pass
+                else:
+                    self._error(500, "internal error")
                 return
         self._send_json(200, {"result": result})
 

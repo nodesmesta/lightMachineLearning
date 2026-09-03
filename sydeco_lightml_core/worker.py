@@ -16,9 +16,11 @@ import abc
 import concurrent.futures
 import json
 import os
+import queue
 import secrets
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, Optional, Union
 
@@ -107,6 +109,44 @@ class InferenceTimeout(Exception):
 
 class WorkerNotReady(Exception):
     """The worker is broken/stopped and cannot serve this request."""
+
+
+class StreamTimeout(InferenceTimeout):
+    """K5: a stream violated first-chunk, idle, or total bounds."""
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+class StreamBackpressure(Exception):
+    """K5/P5: the producer could not enqueue a chunk within the bounded
+    ``stream_backpressure_timeout`` window, so the stream is terminated with
+    a controlled error instead of buffering without limit.
+    """
+
+
+class StreamRestarted(Exception):
+    """K5/P6: the worker generation serving this stream was recycled/stopped
+    while the stream was active. The stream is terminated deterministically
+    instead of continuing to flow from an abandoned generation.
+    """
+
+
+def _stream_timeouts(resource_limits: Dict[str, Any], default_timeout: float) -> Dict[str, float]:
+    """Return K5 stream timeout bounds with M4 fallback semantics."""
+    def _get(name: str) -> float:
+        try:
+            value = float(resource_limits.get(name, default_timeout))
+        except (TypeError, ValueError):
+            value = default_timeout
+        return max(value, 0.001)
+
+    return {
+        "first_chunk": _get("stream_first_chunk_timeout"),
+        "idle": _get("stream_idle_timeout"),
+        "total": _get("stream_total_timeout"),
+    }
 
 
 class InProcessWorkerHost(WorkerHost):
@@ -234,6 +274,182 @@ class InProcessWorkerHost(WorkerHost):
                     f"stale worker generation ignored: {self._app_id}"
                 )
         return result
+
+    def stream(self, request: Dict[str, Any], request_id: str):
+        """K5 minimal streaming adapter hook.
+
+        Streaming is an optional adapter capability: existing applications keep
+        using ``infer()``, while a streaming-capable adapter may expose
+        ``stream(request, context)`` and yield JSON-serializable chunks. The
+        Core/server layer owns NDJSON framing and request metadata.
+        """
+        with self._lifecycle_lock:
+            if self._broken or self._stopped or self._adapter is None:
+                raise WorkerNotReady(f"worker not ready: {self._app_id}")
+            context = dict(self._context)
+            context["request_id"] = request_id
+            generation = self._generation
+            adapter = self._adapter
+            timeouts = _stream_timeouts(
+                context.get("config", {}).get("resource_limits", {}), self._timeout
+            )
+            limits = context.get("config", {}).get("resource_limits", {})
+            try:
+                buffer_size = int(limits.get("stream_buffer_size", 1))
+            except (TypeError, ValueError):
+                buffer_size = 1
+            buffer_size = max(buffer_size, 1)
+            try:
+                bp_value = float(limits.get("stream_backpressure_timeout", 0.0))
+            except (TypeError, ValueError):
+                bp_value = 0.0
+            # P5 selected behavior (user decision): bounded queue; when the
+            # queue stays full past stream_backpressure_timeout the stream
+            # terminates with a controlled error. Absent/zero config keeps
+            # the previous block-producer behavior (still bounded by maxsize).
+            bp_timeout: Optional[float] = bp_value if bp_value > 0.0 else None
+        stream_fn = getattr(adapter, "stream", None)
+        if stream_fn is None:
+            raise RuntimeError("streaming not supported by app")
+
+        chunks: queue.Queue = queue.Queue(maxsize=buffer_size)
+        abort: queue.Queue = queue.Queue(maxsize=1)
+        cancel = threading.Event()
+        done = object()
+
+        def _put_cancellable(item: tuple[str, Any]) -> bool:
+            while not cancel.is_set():
+                try:
+                    chunks.put(item, timeout=0.05)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def _put_chunk(item: tuple[str, Any]) -> bool:
+            """Enqueue one chunk bounded by the backpressure window.
+
+            Returns False when the queue stayed full past the configured
+            window (or when cancelled); True once the item is placed.
+            """
+            if bp_timeout is None:
+                return _put_cancellable(item)
+            deadline = time.monotonic() + bp_timeout
+            while not cancel.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                try:
+                    chunks.put(item, timeout=min(0.05, remaining))
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def _produce() -> None:
+            iterator = None
+            backpressured = False
+            try:
+                iterator = iter(stream_fn(request, context))
+                while not cancel.is_set():
+                    try:
+                        chunk = next(iterator)
+                    except StopIteration:
+                        break
+                    if not _put_chunk(("chunk", chunk)):
+                        backpressured = not cancel.is_set()
+                        break
+                if not cancel.is_set() and not backpressured:
+                    _put_cancellable(("done", done))
+            except BaseException as exc:  # propagate sanitized by server layer
+                if not cancel.is_set():
+                    _put_cancellable(("error", exc))
+            finally:
+                if backpressured:
+                    try:
+                        abort.put_nowait(
+                            StreamBackpressure(
+                                "stream backpressure: buffer full beyond "
+                                f"stream_backpressure_timeout: {self._app_id}"
+                            )
+                        )
+                    except queue.Full:
+                        pass
+                if (cancel.is_set() or backpressured) and iterator is not None:
+                    close = getattr(iterator, "close", None)
+                    if close is not None:
+                        try:
+                            close()
+                        except Exception:
+                            pass
+
+        producer_thread = threading.Thread(
+            target=_produce,
+            daemon=True,
+            name=f"sydeco-stream-{self._app_id}",
+        )
+        producer_thread.start()
+
+        started = time.monotonic()
+        seen = False
+        completed = False
+        restarted = False
+        reason: str = "total"
+
+        def _generation_stale() -> bool:
+            with self._lifecycle_lock:
+                return self._stopped or self._generation != generation
+
+        try:
+            while True:
+                if _generation_stale():
+                    restarted = True
+                    break
+                if not abort.empty():
+                    completed = True
+                    raise abort.get_nowait()
+                elapsed = time.monotonic() - started
+                remaining_total = timeouts["total"] - elapsed
+                if remaining_total <= 0:
+                    reason = "total"
+                    break
+                wait = min(timeouts["idle"] if seen else timeouts["first_chunk"], remaining_total)
+                wait_is_total_deadline = wait == remaining_total
+                try:
+                    kind, value = chunks.get(timeout=wait)
+                except queue.Empty:
+                    if not abort.empty():
+                        completed = True
+                        raise abort.get_nowait()
+                    reason = "total" if wait_is_total_deadline else ("idle" if seen else "first_chunk")
+                    break
+                if kind == "chunk":
+                    if _generation_stale():
+                        restarted = True
+                        break
+                    seen = True
+                    yield value
+                    continue
+                if kind == "done":
+                    completed = True
+                    return
+                if kind == "error":
+                    completed = True
+                    raise value
+
+            completed = True
+            cancel.set()
+            if restarted:
+                producer_thread.join(timeout=0.2)
+                raise StreamRestarted(
+                    f"worker generation recycled during stream: {self._app_id}"
+                )
+            self._on_timeout(generation)
+            raise StreamTimeout(reason, f"stream {reason} timeout: {self._app_id}")
+        finally:
+            if not completed:
+                cancel.set()
+                producer_thread.join(timeout=0.2)
 
     def _on_timeout(self, generation: int) -> None:
         """Quarantine a timed-out dev-host generation and recover in BACKOFF.
@@ -814,6 +1030,77 @@ class SystemdTransientWorkerHost(WorkerHost):
                 f"worker error {resp.status}: {obj.get('error', obj)}"
             )
         return obj["result"]
+
+    def stream(self, request: Dict[str, Any], request_id: str):
+        """Forward a K5 stream to the worker using the current Bearer secret.
+
+        This mirrors ``infer()`` for the production/systemd path: the worker
+        endpoint is internal loopback only, protected by the same per-generation
+        credential delivered via LoadCredential=, while the Core server remains
+        responsible for public NDJSON event framing.
+        """
+        import http.client
+        import socket
+
+        if not self._started or not self._ready:
+            raise WorkerNotReady(f"worker not ready: {self._app_id}")
+        body = json.dumps(request).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/x-ndjson",
+        }
+        if self._secret is not None:
+            headers["Authorization"] = "Bearer " + self._secret
+        conn = None
+        try:
+            conn = http.client.HTTPConnection(
+                "127.0.0.1", self._port, timeout=self._timeout
+            )
+            conn.request("POST", "/stream", body=body, headers=headers)
+            resp = conn.getresponse()
+            if resp.status != 200:
+                data = resp.read()
+                raise RuntimeError(f"worker stream error {resp.status}: {data!r}")
+            while True:
+                line = resp.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line.decode("utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise WorkerNotReady(
+                        f"worker returned invalid stream response: {self._app_id}"
+                    ) from exc
+                if "data" in obj:
+                    yield obj["data"]
+                elif "error" in obj:
+                    raise RuntimeError(f"worker stream error: {obj['error']}")
+            conn.close()
+        except socket.timeout:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._audit_event(
+                "INFERENCE_TIMEOUT",
+                detail=f"stream no response within {self._timeout:.0f}s",
+            )
+            self._recycle_after_timeout()
+            raise InferenceTimeout(
+                f"stream timeout after {self._timeout:.0f}s: {self._app_id}"
+            )
+        except (ConnectionRefusedError, ConnectionResetError, OSError) as exc:
+            raise WorkerNotReady(f"worker unreachable: {self._app_id}") from exc
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     # ---- timeout recycle (Day 1B, 2026-08-26) --------------------------
 

@@ -29,7 +29,13 @@ from urllib.parse import urlparse
 from .health import AppStatus
 from .schema import validate_schema
 from .secrets import verify_token
-from .worker import InferenceTimeout, WorkerNotReady
+from .worker import (
+    InferenceTimeout,
+    StreamBackpressure,
+    StreamRestarted,
+    StreamTimeout,
+    WorkerNotReady,
+)
 
 log = logging.getLogger("sydeco-lightml.server")
 
@@ -78,6 +84,11 @@ class CoreHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_ndjson_event(self, event: Dict[str, Any]) -> None:
+        """Write exactly one JSON object as one NDJSON line (K5)."""
+        self.wfile.write(json.dumps(event).encode("utf-8") + b"\n")
+        self.wfile.flush()
 
     def _read_body(self, limit: int) -> Optional[bytes]:
         """Read the request body, enforcing the K5 size limit.
@@ -275,6 +286,11 @@ class CoreHandler(BaseHTTPRequestHandler):
             })
             return
 
+        wants_stream = "application/x-ndjson" in self.headers.get("Accept", "")
+        if wants_stream:
+            self._handle_stream_infer(app_id, version, request_id, started, items[0])
+            return
+
         # run (single-flight M3, timeout M4)
         host = service.worker_host(app_id)
         try:
@@ -335,3 +351,90 @@ class CoreHandler(BaseHTTPRequestHandler):
         duration_ms = int((time.time() - started) * 1000)
         self._audit(app_id, request_id, "ok", duration_ms, 200)
         self._send_json(200, envelope)
+
+    def _stream_event_base(self, app_id: str, version: str, request_id: str) -> Dict[str, Any]:
+        return {"request_id": request_id, "app": app_id, "app_version": version}
+
+    def _handle_stream_infer(
+        self,
+        app_id: str,
+        version: str,
+        request_id: str,
+        started: float,
+        item: Dict[str, Any],
+    ) -> None:
+        """K5 minimal NDJSON streaming path for POST /infer.
+
+        Uses the same public endpoint, edge auth, validation and readiness path
+        as normal inference. The adapter yields chunks; Core owns event
+        metadata and JSONL framing so adapter newlines cannot alter protocol
+        boundaries.
+        """
+        service = getattr(self.server, "service")
+        host = service.worker_host(app_id)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        base = self._stream_event_base(app_id, version, request_id)
+        count = 0
+        try:
+            self._send_ndjson_event({**base, "event": "accepted"})
+            for chunk in host.stream(item, request_id):
+                self._send_ndjson_event({
+                    **base,
+                    "event": "chunk",
+                    "seq": count,
+                    "data": chunk,
+                })
+                count += 1
+            self._send_ndjson_event({**base, "event": "completed", "chunks": count})
+            duration_ms = int((time.time() - started) * 1000)
+            self._audit(app_id, request_id, "ok", duration_ms, 200, "stream")
+        except (BrokenPipeError, ConnectionResetError):
+            duration_ms = int((time.time() - started) * 1000)
+            self._audit(app_id, request_id, "cancelled", duration_ms, 499, "STREAM_CANCELLED")
+        except InferenceTimeout as exc:
+            reason = exc.reason if isinstance(exc, StreamTimeout) else "inference"
+            self._audit(app_id, request_id, "fail", 0, 504, "stream timeout")
+            self._send_ndjson_event({
+                **base,
+                "event": "timeout",
+                "reason": reason,
+                "code": "504",
+                "message": "stream timeout",
+            })
+        except WorkerNotReady:
+            self._audit(app_id, request_id, "fail", 0, 503, "worker not ready")
+            self._send_ndjson_event({
+                **base,
+                "event": "worker_error",
+                "code": "503",
+                "message": "app not ready",
+            })
+        except StreamBackpressure:
+            self._audit(app_id, request_id, "fail", 0, 429, "stream backpressure")
+            self._send_ndjson_event({
+                **base,
+                "event": "worker_error",
+                "code": "429",
+                "message": "stream backpressure",
+            })
+        except StreamRestarted:
+            duration_ms = int((time.time() - started) * 1000)
+            self._audit(app_id, request_id, "fail", duration_ms, 503, "STREAM_RESTARTED")
+            self._send_ndjson_event({
+                **base,
+                "event": "worker_error",
+                "code": "503",
+                "message": "worker restarted",
+            })
+        except Exception as exc:
+            log.exception("stream infer failed for %s", app_id)
+            self._audit(app_id, request_id, "fail", 0, 500, f"stream exception: {type(exc).__name__}")
+            self._send_ndjson_event({
+                **base,
+                "event": "worker_error",
+                "code": "500",
+                "message": "internal error",
+            })
