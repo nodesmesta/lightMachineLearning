@@ -37,10 +37,8 @@ changes.
 | `5d6e8d5` | Close K5 systemd streaming parity: tests plus production-path fixes for P1-P5 |
 | `1b90cf3` | Document K5 revision evidence and replace stale README with the 04-09 report |
 
-Commit count after the documentation/evidence commit: **19**.
-
-The final package is generated from the committed README/evidence state.
-Final clean-tree state is recorded in the P8 evidence and package hash section.
+Final HEAD, commit count, clean-tree state, package name, and package hash are
+recorded in the P8 evidence and package hash section.
 
 ## P0 - Baseline And Reviewer Findings
 
