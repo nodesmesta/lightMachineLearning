@@ -1,255 +1,349 @@
-# 31082026
+# 04092026
 
 ## Summary
 
-This session executes the reviewer's **PHASE 2 / DAY 3 — PER-APPLICATION
-DEPENDENCY ISOLATION (J1/J2)** directive from `JAMALUDIN_DailyReport_28-08-2026
-REVIEWED.docx` (review of the 28-08 submission, copied into this day's folder
-`week-5/31-08-2026/`). Day-2 verdict (verbatim): **"PHASE 2 / DAY 2 —
-CONDITIONALLY ACCEPTED"** (92/100; Engineering 95, Evidence 94, Packaging 84).
-The reviewer's standing order: "Do not change yesterday's architecture.
-Before beginning the main Day-3 work, Jamaludin must perform a short P0 Day-2
-closure correction." `REMAINING WORK TO DO FROM TODAY FOR JAMALUDIN.docx`
-confirms J1/J2 is today's priority ("Until each application owns its
-environment and dependencies, I would not consider LightML truly autonomous").
+This report covers **PHASE 2 / DAY 4B - K5 SYSTEMD PRODUCTION-PATH REVISION**
+for SYDECO LightML V2. The work is derived from the review document
+`Jamaludin REPORTS 3 SEPTEMBER REVIEWED.docx`, which did not accept Day 4 K5
+as closed.
 
-The session is split into two parts:
+Reviewer verdict for the 03-09 submission:
 
-1. **P0 — Day-2 closure (mandatory)** — close the reviewer's three concrete
-   Day-2 defects plus the packaging that corresponds to the final commit:
-   leakage regression test uses a runtime-generated credential; the ephemeral
-   worker credential is removed on EVERY path (exception-safe lifecycle) with
-   3 deterministic lifecycle tests; repository README updated to the
-   authoritative 28-Aug state; `data/` evidence directory created and all
-   evidence shipped inside the ZIP; correct `<name>.zip` + `<name>.zip.sha256`
-   sidecar naming.
-2. **P1..P7 — J1/J2 per-application dependency isolation** (today's core work):
-   one Python venv per application/version (J1), offline wheelhouse only (J2),
-   worker started with the per-app interpreter (P3), two-app incompatible-
-   dependency proof (P4), failure/security tests (P5), full regression (P6),
-   evidence + daily report (P7).
+> I do not yet accept PHASE 2 / DAY 4 - K5 as closed.
 
-Status (verbatim line): **SYDECO LIGHTML UNIVERSAL RUNTIME V2 — DEVELOPMENT /
-PROOF OF CONCEPT — AWAITING REVIEW.**
+Reviewer score: **84/100 - technically strong work, but REVISION REQUIRED
+before K5 acceptance.**
 
-## P0 — Close Day 2 first (mandatory)
+The blocker was specific: K5 behavior was proven mostly on
+`InProcessWorkerHost`, while the production-path `SystemdTransientWorkerHost`
+did not yet have equivalent timeout, terminal-frame, lifecycle, cancellation,
+and backpressure proof.
 
-### P0.1 — Leakage test uses a runtime-generated secret
+Status after this revision:
 
-**File changed:** `tests/test_channel_auth_b.py`, `tests/test_channel_auth_c.py`.
+**PHASE 2 / DAY 4 - K5 STREAMING: REVISION SUBMITTED / AWAITING REVIEW.**
 
-**What:** `test_05_no_secret_in_manifest_registry_audit_logs` (auth_b) and
-`test_04_token_absent_from_logs_manifest_registry` (auth_c) sweep the whole
-repo for their test secret. They used a deterministic literal (e.g.
-`secret = "99" * 32`), so the Python bytecode (`__pycache__/*.pyc`) embedded
-that literal and the test reported its OWN `.pyc` as a leakage — test-harness
-contamination, not a real worker-credential leak. Fixed per reviewer's
-preferred correction: the credential is generated dynamically at runtime with
-`secrets.token_hex(32)`. Reproducible under any interpreter / pyc state; no
-`__pycache__` deletion needed.
+## Scope
 
-**Verification:** `test_channel_auth_b` 7/7 PASS; `test_channel_auth_c` 6/6
-PASS under a normal Python invocation with pyc present.
+This revision only closes K5 production-path parity. It does not start J4B,
+CRA integration, F4/F6 schema migration/update handling, production signing
+key infrastructure, permanent installer/unit acceptance, or LightML 1.0.1
+changes.
 
-### P0.2 / P0.3 — Exception-safe credential cleanup + lifecycle tests
+## Commit Log
 
-**File changed:** `sydeco_lightml_core/worker.py`; new
-`tests/test_credential_lifecycle.py`.
+| Commit | Purpose |
+|--------|---------|
+| `5d6e8d5` | Close K5 systemd streaming parity: tests plus production-path fixes for P1-P5 |
 
-**What:** in `SystemdTransientWorkerHost.start()` the credential file was
-created before `systemd-run`; if launch or readiness failed, `_started` stayed
-False and `stop()`'s `if not self._started: return` returned before unlinking
-the root-only 0600 file — a failed launch could leave a credential file
-behind. Now `_remove_credential()` (idempotent) is called from `stop()` before
-the `_started` guard AND from `start()` on both failure paths (systemd-run
-failure, readiness failure), plus a bounded `stop()` on the never-ready path
-so no orphan unit remains. The reviewer-required guarantee is met verbatim:
-"Every credential file must disappear after successful stop AND after every
-failed launch/start path."
+Commit count after the implementation commit: **18**.
 
-**Verification:** three deterministic non-privileged tests (mock subprocess) —
-`test_launch_failure_removes_credential`, `test_never_ready_removes_credential`,
-`test_normal_stop_removes_credential` — 3/3 PASS.
+The final README/report/package commit is created after this README is written.
+Final clean-tree state is recorded in the P8 evidence and package hash section.
 
-### P0.4–P0.8 — regression, evidence, packaging
+## P0 - Baseline And Reviewer Findings
 
-- README.md = authoritative report; `data/` holds all evidence.
-- Full suite in the repo after closure: **86/86 PASS** (83 prior + 3
-  lifecycle); from a fresh extraction **86/86 PASS**; py_compile 17/17.
-- Packaging: `SYDECO_LIGHTML_V2_DEV_2026-08-31.zip` + correctly named
-  `.sha256` sidecar; verified git clean, fresh extraction PASS, no `.pyc`,
-  SHA matches, evidence corresponds to final commit.
+Baseline repository state before code changes:
 
-## P1 — One Python environment per application/version (J1)
+```text
+HEAD: b21eb0f
+commit count: 17
+git status: clean
+```
 
-**File changed:** `sydeco_lightml_core/core.py` — new `CoreService.build_app_venv()`.
+Existing streaming tests were run from an isolated copy:
 
-**What:** installing an app that declares `dependencies` builds a **dedicated
-venv for that application/version** inside its versioned dir
-(`<app_root>/venv`) and records `venv`/`wheelhouse` in the registry
-(`filesystem_paths`). Resolution is per-app (M1/C3): `app_id + version ->
-application files + models + dedicated venv + worker`. No second/global Python
-environment is created and the Core remains generic (it never imports an
-application's layout or dependencies). Registry records the resolved per-version
-paths; the worker resolves its interpreter from the registry.
+```text
+python3 -m unittest discover -s tests -p 'test_streaming_systemd_auth.py' -v
+Ran 2 tests in 1.014s
+OK
 
-## P2 — Offline wheelhouse only (J2)
+python3 -m unittest discover -s tests -p 'test_streaming*.py' -v
+Ran 25 tests in 141.727s
+OK
+```
 
-**What:** installation builds the app venv **exclusively** from the app's OWN
-local wheelhouse (`<app_root>/wheelhouse`) via
-`pip install --no-index --no-deps --find-links=<wheelhouse> <spec>` — no PyPI,
-no implicit network fallback, no dependency silently taken from the Core
-environment. Dependencies absent / corrupt / version-mismatched are REJECTED
-(fail-closed), leaving no partial environment. Wheel material is verified
-up-front (zipfile integrity, bundle-wheel match, J4). Wording (standing):
-needs no Internet beyond OS dependencies.
+Baseline findings confirmed:
 
-## P3 — Worker uses the application-specific interpreter
+| Finding | Baseline status |
+|---------|-----------------|
+| Systemd stream used ordinary `inference_timeout` as HTTP timeout | confirmed |
+| `stream_first_chunk_timeout`, `stream_idle_timeout`, `stream_total_timeout` were not independently enforced in systemd path | confirmed |
+| EOF meant normal completion without explicit terminal frame | confirmed |
+| Worker runtime encoded stream errors as normal `data` | confirmed |
+| Batch streaming silently used `items[0]` | confirmed |
+| Existing systemd stream tests covered auth only | confirmed |
 
-**File changed:** `sydeco_lightml_core/core.py` (`_start_app_systemd`).
+Evidence: `data/evidence_p0_systemd_k5_baseline.txt`.
 
-**What:** the systemd context previously set `"python": sys.executable` (the
-Core's interpreter). It now resolves the per-app interpreter from the registry
-venv (`<app_root>/venv/bin/python`) when one exists, so Application A's worker
-starts with A's Python and Application B's worker with B's Python. The Core
-does not load the application's dependencies.
+## P1 - RED Systemd Parity Tests
 
-## P4 — Proven real dependency isolation (central acceptance)
+Added `tests/test_streaming_systemd_parity.py` with focused RED coverage for
+the production-path host class.
 
-**Proof (new `tests/test_dep_isolation.py`):** two deterministic apps both
-depend on the stdlib-only fixture package `depballast` at INCOMPATIBLE
-versions — App A -> 1.0.0, App B -> 2.0.0 — each wheel built offline and placed
-in each app's own `wheelhouse/`. Proved simultaneously:
+RED baseline:
 
-| App | declared | installed | interpreter | behavior() | VERSION |
-|-----|----------|-----------|-------------|------------|---------|
-| app-a | depballast 1.0.0 | 1.0.0 | `<app-a>/venv/bin/python` | '1.0.0-behavior' | 1.0.0 |
-| app-b | depballast 2.0.0 | 2.0.0 | `<app-b>/venv/bin/python` | '2.0.0-behavior' | 2.0.0 |
+```text
+python3 -m unittest discover -s tests -p 'test_streaming_systemd_parity.py' -v
+Ran 8 tests in 5.055s
+FAILED (failures=7, errors=1)
+```
 
-- Both return valid results (behavior reflects its own version).
-- Distinct per-app interpreters (separate venvs).
-- **Restart stability:** breaking/removing App A's venv does NOT affect App B
-  (B still imports/serves 2.0.0); installing/updating A cannot alter B's
-  environment.
-- **Neither modifies the Core environment:** the global/system python cannot
-  `import depballast` (it exists only inside the per-app venvs).
+The RED tests cover:
 
-## P5 — Failure and security tests
+| Test area | Production-path requirement |
+|-----------|-----------------------------|
+| first chunk timeout | no first chunk beyond bound -> `StreamTimeout("first_chunk")` |
+| idle timeout | stall between chunks -> `StreamTimeout("idle")` |
+| total timeout | active stream cannot exceed monotonic total deadline |
+| adapter error frame | internal error is not yielded as chunk data |
+| abnormal EOF | EOF before terminal frame fails closed |
+| restart during stream | old stream raises `StreamRestarted` |
+| client cancellation | cancellation triggers bounded scoped lifecycle action |
+| slow consumer | slow consumer does not produce silent unbounded behavior |
 
-`tests/test_dep_isolation.py` failure matrix (reviewer P5 minimum set) — all
-fail CLOSED with no half-valid environment:
+Evidence: `data/evidence_p1_systemd_k5_red_tests.txt`.
+
+## P2 - Private Stream Terminal Protocol
+
+Changed the private worker-to-Core `/stream` protocol from implicit
+`{"data": ...}` only to explicit internal frames:
+
+```json
+{"type": "chunk", "data": "<adapter chunk>"}
+{"type": "completed"}
+{"type": "error", "error": {"code": "500", "message": "internal error"}}
+```
+
+Systemd Core-side parsing now accepts only `chunk`, `completed`, and `error`.
+Malformed frames fail closed. EOF before `completed` or `error` fails closed.
+Adapter exception text is not forwarded.
+
+Targeted verification:
+
+```text
+python3 -m unittest tests.test_streaming_systemd_parity.SystemdStreamingParityTests.test_systemd_adapter_error_frame_is_not_returned_as_chunk_data tests.test_streaming_systemd_parity.SystemdStreamingParityTests.test_systemd_abnormal_eof_before_terminal_frame_fails_closed -v
+Ran 2 tests in 1.015s
+OK
+
+python3 -m unittest discover -s tests -p 'test_streaming_systemd_auth.py' -v
+Ran 2 tests in 1.012s
+OK
+```
+
+Evidence: `data/evidence_p2_systemd_terminal_protocol.txt`.
+
+## P3 - Systemd Streaming Deadlines
+
+`SystemdTransientWorkerHost.stream()` now enforces three independent K5 bounds
+from `resource_limits`:
+
+| Bound | Enforcement |
+|-------|-------------|
+| `stream_first_chunk_timeout` | max wait for first internal stream frame |
+| `stream_idle_timeout` | max gap between chunks |
+| `stream_total_timeout` | monotonic absolute total stream deadline |
+
+Timeout handling closes the connection, audits `INFERENCE_TIMEOUT`, recycles
+only the affected worker, and raises `StreamTimeout(reason, ...)`.
+
+Targeted verification:
+
+```text
+python3 -m unittest tests.test_streaming_systemd_parity.SystemdStreamingParityTests.test_systemd_first_chunk_timeout_uses_stream_bound tests.test_streaming_systemd_parity.SystemdStreamingParityTests.test_systemd_idle_timeout_uses_stream_bound tests.test_streaming_systemd_parity.SystemdStreamingParityTests.test_systemd_total_timeout_uses_monotonic_absolute_deadline -v
+Ran 3 tests in 0.372s
+OK
+```
+
+Evidence: `data/evidence_p3_systemd_stream_timeouts.txt`.
+
+## P4 - Systemd Lifecycle And Cancellation
+
+`SystemdTransientWorkerHost.stream()` now snapshots the active stream identity:
+
+```text
+_unit
+_launch_count
+_secret
+```
+
+If the worker is stopped, restarted, relaunched, or credential-rotated while a
+stream is active, the old stream is invalidated and raises `StreamRestarted`
+instead of completing normally.
+
+Client/generator cancellation closes the connection, audits `STREAM_CANCELLED`,
+and triggers scoped lifecycle action through the existing recycle path.
+
+Targeted verification:
+
+```text
+python3 -m unittest tests.test_streaming_systemd_parity.SystemdStreamingParityTests.test_systemd_restart_during_active_stream_raises_stream_restarted tests.test_streaming_systemd_parity.SystemdStreamingParityTests.test_systemd_client_cancellation_does_not_leave_worker_busy -v
+Ran 2 tests in 1.022s
+OK
+```
+
+Evidence: `data/evidence_p4_systemd_lifecycle_cancellation.txt`.
+
+## P5 - Protocol Correctness And Backpressure
+
+Public protocol corrections:
 
 | Case | Result |
 |------|--------|
-| missing dependency wheel | REJECT |
-| wrong/unavailable dependency version | REJECT |
-| corrupt dependency material | REJECT (verified before venv; no half env) |
-| App A dependency failure | App B remains serving its own version |
-| incomplete venv creation | no application marked READY |
-| no Internet available | valid offline install still succeeds |
-| worker uses per-app interpreter | confirmed |
-| dependency paths cannot escape allowed area | by construction (inside app_root) |
-| dependency name/path shell-injection | no command executed (ARGV, not shell) |
-| failed install leaves no registry entry / half env | no falsely-active entry; partial venv removed |
+| streaming batch request with `{"inputs": [...]}` | HTTP 400 JSON, rejected before worker |
+| app without `stream()` | NDJSON `worker_error`, code 400, message `streaming not supported` |
+| systemd slow consumer | bounded by `stream_backpressure_timeout`, raises `StreamBackpressure` |
 
-## P6 — Regression
+Targeted verification:
+
+```text
+python3 -m unittest tests.test_streaming_contract.StreamingContractTests.test_streaming_batch_request_is_rejected_before_worker tests.test_streaming_contract.StreamingContractTests.test_streaming_unsupported_app_returns_controlled_error -v
+Ran 2 tests in 10.106s
+OK
+
+python3 -m unittest discover -s tests -p 'test_streaming_systemd_parity.py' -v
+Ran 8 tests in 2.909s
+OK
+
+python3 -m unittest discover -s tests -p 'test_streaming*.py' -v
+Ran 35 tests in 144.783s
+OK
+```
+
+Evidence: `data/evidence_p5_stream_protocol_correctness.txt`.
+
+## P6 - Targeted K5 Parity Verification
+
+Targeted verification was run from `/tmp/sydeco_k5_p6_verify`.
+
+```text
+py_compile targeted: PASS
+systemd parity tests: 8/8 PASS
+systemd auth tests: 2/2 PASS
+public streaming contract tests: 8/8 PASS
+full targeted K5 streaming suite: 35/35 PASS
+```
+
+Coverage split:
+
+| Group | Count |
+|-------|-------|
+| previous K5 streaming tests from 03-09 | 25 |
+| new `SystemdTransientWorkerHost` parity tests | 8 |
+| new public protocol correctness tests | 2 |
+| total targeted K5 streaming tests | 35 |
+
+Evidence scan found no concrete token material.
+
+Evidence: `data/evidence_p6_k5_targeted_parity.txt`.
+
+## P7 - Full Regression And Fresh Extraction
+
+Full regression from isolated repo copy:
+
+```text
+python3 -m unittest discover -s tests -v
+Ran 134 tests in 443.808s
+OK
+```
+
+Fresh extraction regression:
+
+```text
+python3 -m unittest discover -s tests -v
+Ran 134 tests in 443.150s
+OK
+```
+
+Repo-wide compile from fresh extraction:
+
+```text
+find . -name '*.py' -print0 | xargs -0 python3 -m py_compile
+<no output; command exited 0>
+```
+
+Hygiene:
+
+```text
+find /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV -name '__pycache__' -o -name '*.pyc' -o -name '*.pyo' | head -100
+<no output>
+```
+
+Scope checks:
 
 | Check | Result |
 |-------|--------|
-| Full suite IN THE REPO | **91/91 PASS** (86 prior + 5 new J1/J2) |
-| Full suite FROM FRESH ZIP EXTRACTION | **91/91 PASS** |
-| py_compile core modules | 17/17 |
-| dev-path occurrences in source (core/tests/examples) | 0 |
-| git working tree | clean (HEAD `f64042c`) |
-| LightML 1.0.1 / CRA / production key | untouched / untouched / not created |
+| full regression | 134/134 PASS |
+| fresh extraction regression | 134/134 PASS |
+| test count higher than 124 baseline | PASS |
+| repo-wide `py_compile` | PASS |
+| `__pycache__` / `.pyc` / `.pyo` in main repo | none |
+| production signing key artifact | none |
+| LightML 1.0.1 | untouched |
+| CRA | untouched |
 
-## P7 — Evidence and daily report
+Evidence: `data/evidence_p7_regression_fresh_extraction.txt`.
 
-- `data/evidence_day3_j12_venv_isolation.txt` — J1/J2 venv/wheelhouse
-  architecture paths, offline mechanism, commands, App A/B incompatible-
-  dependency proof.
-- `data/evidence_day3_failure_matrix.txt` — reviewer P5 failure/security
-  matrix.
-- This README.md (English, single source of truth).
-- `Dev/Report/week-5/JAMALUDIN_DailyReport_31-08-2026.docx` (generated from
-  this README).
-- `SYDECO_LIGHTML_V2_DEV_2026-08-31.zip` + `.sha256` sidecar containing
-  source + `.git` + tests + README + ALL `data/` evidence; verified fresh
-  extraction PASS, no `.pyc`, SHA matches.
+## P8 - Report And Package Discipline
 
-## Bugs / architecture issues found and fixed (2026-08-31)
+P8 actions:
 
-| # | Issue (root cause) | Fix |
-|---|--------------------|-----|
-| 1 | (reviewer P0-1) leakage test used a deterministic literal secret, so compiled bytecode reported itself as a leakage | runtime `secrets.token_hex(32)` in the two leak-scan tests |
-| 2 | (reviewer P0-2) failed launch could leave the ephemeral root-only 0600 credential file because `stop()` returned before unlinking when `_started` was False | idempotent `_remove_credential()` called from `stop()` before the guard and from `start()` on both failure paths; 3 lifecycle tests |
-| 3 | (packaging) the delivered ZIP had no `data/` evidence because `data/` was git-ignored | track `data/evidence_*.txt` (keep `data/registry/` ignored) so the package corresponds to the final commit |
-| 4 | (J1/J2 gap) worker used the Core's `sys.executable`, not a per-app interpreter | `build_app_venv()` + registry venv path + per-app interpreter resolution (P1/P2/P3) |
+| Artifact | Status |
+|----------|--------|
+| final English README | this file |
+| daily report DOCX | generated from this README via pandoc |
+| final ZIP | generated after README/report commit |
+| `.zip.sha256` sidecar | generated from the exact final ZIP |
+| final package evidence | recorded in `data/evidence_p8_package_report_hash.txt` |
 
-## Verification (before declaring done)
+The sidecar name must be exactly:
 
-| Check | Result |
-|-------|--------|
-| P0 closure focused (auth_b / auth_c / lifecycle) | 7/7 / 6/6 / 3/3 PASS |
-| J1/J2 focused (`test_dep_isolation`) | 5/5 PASS |
-| FULL suite IN THE REPO | 91/91 PASS |
-| Full suite FROM FRESH ZIP EXTRACTION | 91/91 PASS, 0 dev-path, py_compile 17/17 |
-| Leakage sweep | 0 occurrences |
-| 0 `__pycache__` / `.pyc` in deliverable | PASS |
-| git commit + clean tree | 3 commits; clean |
-| Evidence files secret-free | PASS |
-| LightML 1.0.1 / CRA / production key | untouched / untouched / not created |
+```text
+SYDECO_LIGHTML_V2_DEV_2026-09-04.zip.sha256
+```
 
-## Evidence table
+## Evidence Table
 
 | File | Content |
 |------|---------|
-| `data/evidence_p1_recycle_concurrency.txt` | Day-2 P1 (concurrent-timeout recycle) |
-| `data/evidence_p2_p3_secret_delivery.txt` | Day-2 P2/P3 (per-generation secret, LoadCredential) |
-| `data/evidence_p4_auth_endpoints.txt` | Day-2 P4 (Bearer on all worker endpoints) |
-| `data/evidence_p5_credential_isolation.txt` | Day-2 P5 (App A vs App B, old vs new gen) |
-| `data/evidence_p6_leakage.txt` | Day-2 P6 (0 occurrences) |
-| `data/evidence_p7_acceptance_matrix.txt` | Day-2 P7 non-privileged (13-row matrix) |
-| `data/evidence_p7_root_acceptance.txt` | Day-2 P7 ROOT real-systemd (31/31) |
-| `data/evidence_p8_fresh_extraction.txt` | Day-2 P8 fresh extraction |
-| `data/evidence_regression_full_suite.txt` | Day-2 P8 full suite in repo |
-| `data/evidence_day3_j12_venv_isolation.txt` | **NEW** Day-3 J1/J2 venv isolation + App A/B proof |
-| `data/evidence_day3_failure_matrix.txt` | **NEW** Day-3 P5 failure/security matrix |
-| `data/SYDECO_LIGHTML_V2_DEV_2026-08-31.zip` + `.sha256` | Day-3 package: source + .git + tests + README + all evidence |
+| `data/evidence_p0_systemd_k5_baseline.txt` | P0 baseline, reviewer findings, coverage matrix |
+| `data/evidence_p1_systemd_k5_red_tests.txt` | P1 RED systemd parity tests |
+| `data/evidence_p2_systemd_terminal_protocol.txt` | P2 private terminal protocol fix |
+| `data/evidence_p3_systemd_stream_timeouts.txt` | P3 systemd first/idle/total timeout proof |
+| `data/evidence_p4_systemd_lifecycle_cancellation.txt` | P4 restart and cancellation parity proof |
+| `data/evidence_p5_stream_protocol_correctness.txt` | P5 batch/unsupported/backpressure proof |
+| `data/evidence_p6_k5_targeted_parity.txt` | P6 targeted K5 parity/security verification |
+| `data/evidence_p7_regression_fresh_extraction.txt` | P7 full regression and fresh extraction |
+| `data/evidence_p8_package_report_hash.txt` | P8 final report/package/hash proof |
 
-## What remains
+## What Remains
 
-- The reviewer's verification of this Day-3 report + package.
-- Phase 2 hardening continues (reviewer's agreed order): streaming (K5),
-  update handling + schema migration (F4/F6), production signing-key
-  infrastructure (R6 infra), permanent systemd units/full installer.
-- CRA integration: NOT started (reviewer constraint preserved).
+K5 is submitted for review after this production-path revision. J4B Dependency
+Artifact Authenticity should start only after reviewer acceptance of this K5
+revision.
 
-## Constraints honored
+## Constraints Honored
 
-- Day-3 scoped EXACTLY to J1/J2 dependency isolation + P0 closure (reviewer's
-  do-not-start list): no streaming/K5, no CRA, no schema migration F4/F6, no
-  production signing key, no permanent systemd unit, no change to LightML
-  1.0.1.
-- No external/cloud dependency — needs no Internet beyond OS dependencies;
-  stdlib-only + the system `cryptography` 3.4.8 package (the one permitted
-  exception); no pip installs against the Internet (offline wheelhouse only).
-- Tests/experiments only in isolated areas (/tmp + the dev repo); no global
-  Python environment created; venv/wheelhouse never committed.
-- Only the TEST signing key exists; no production signing key created.
-- Wording discipline (standing): "needs no Internet beyond OS dependencies".
+- K5 revision only; no J4B implementation.
+- No CRA integration.
+- No F4/F6 schema migration/update handling.
+- No production signing key created or used.
+- No permanent installer/unit acceptance work.
+- No LightML 1.0.1 modification.
+- No new streaming protocol such as WebSocket or SSE.
+- No external/cloud dependency introduced; wording remains "needs no Internet
+  beyond OS dependencies".
+- Evidence files are secret-free.
+- Final package uses `.zip` plus correctly named `.zip.sha256` sidecar.
 
 ## Conclusion
 
-The reviewer's Day-2 closure items are complete (runtime leakage secret,
-exception-safe credential cleanup with 3 lifecycle tests, evidence inside the
-package, correct sidecar name). Day-3 J1/J2 delivers the central acceptance:
-each application owns its Python environment and dependencies, isolated from
-every other application and from the Core, built entirely offline from its own
-local wheelhouse, and launched under its own interpreter. Full suite passes
-91/91 in the repo and from a fresh extraction; the working tree is clean after
-the three session commits. LightML 1.0.1 untouched. CRA untouched. No
-production signing key created.
+The reviewer-blocking K5 production-path parity gaps have been addressed.
+`SystemdTransientWorkerHost` now has explicit private stream terminal frames,
+independent first/idle/total stream deadlines, restart invalidation, bounded
+cancellation behavior, and slow-consumer backpressure handling. Public protocol
+gaps for streaming batch and unsupported streaming are closed. Targeted K5
+tests pass 35/35, and full regression plus fresh extraction pass 134/134.
 
-Status: **SYDECO LIGHTML UNIVERSAL RUNTIME V2 — DEVELOPMENT / PROOF OF
-CONCEPT — AWAITING REVIEW.**
+Status: **SYDECO LIGHTML UNIVERSAL RUNTIME V2 - DEVELOPMENT / PROOF OF CONCEPT
+- K5 REVISION SUBMITTED / AWAITING REVIEW.**

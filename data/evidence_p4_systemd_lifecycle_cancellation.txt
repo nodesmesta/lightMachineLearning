@@ -1,0 +1,131 @@
+PHASE 2 / DAY 4B - P4 SYSTEMD LIFECYCLE AND CANCELLATION
+Date: 2026-09-04
+Workspace: /home/sydeco/Dev/Task/week-5/04-09-2026
+Dev repo: /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV
+
+Scope
+-----
+Close SystemdTransientWorkerHost lifecycle/restart and client-cancellation
+parity for active streams.
+
+This section does not close slow-consumer/backpressure behavior. That remains
+the only RED item after P4.
+
+
+Implementation Summary
+----------------------
+File changed:
+  sydeco_lightml_core/worker.py
+
+SystemdTransientWorkerHost.stream() now:
+  - snapshots stream identity when the stream begins:
+      - unit name;
+      - launch count;
+      - per-generation worker secret;
+  - treats changed identity, stopped worker, or relaunched worker as stale;
+  - checks staleness before reads, before yielding chunks, after yielding
+    chunks, and before accepting a completed terminal frame;
+  - closes the old connection and raises StreamRestarted when the active stream
+    belongs to an invalidated worker generation;
+  - handles GeneratorExit from client/generator cancellation by closing the
+    connection, auditing STREAM_CANCELLED, and triggering scoped recycle through
+    the existing _recycle_after_timeout() lifecycle path.
+
+
+Code References
+---------------
+File:
+  /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/sydeco_lightml_core/worker.py
+
+Relevant lines:
+  1059-1061: snapshot active stream identity (_unit, _launch_count, _secret).
+  1081-1087: _stream_stale() detects stop/restart/relaunch/credential rotation.
+  1089-1097: stale stream closes connection and raises StreamRestarted.
+  1119-1121: staleness is checked before each read.
+  1149-1154: staleness is checked before and after yielding a chunk.
+  1155-1159: completion is accepted only if the stream identity is still current.
+  1169-1177: client/generator cancellation closes the connection, audits
+             STREAM_CANCELLED, and triggers scoped recycle.
+
+
+Targeted Verification
+---------------------
+All verification below was run from an isolated copy:
+  /tmp/sydeco_k5_p4_green
+
+Command:
+  python3 -m py_compile sydeco_lightml_core/worker.py tests/test_streaming_systemd_parity.py
+
+Output:
+  <no output; command exited 0>
+
+
+Command:
+  python3 -m unittest tests.test_streaming_systemd_parity.SystemdStreamingParityTests.test_systemd_restart_during_active_stream_raises_stream_restarted tests.test_streaming_systemd_parity.SystemdStreamingParityTests.test_systemd_client_cancellation_does_not_leave_worker_busy -v
+
+Output:
+  test_systemd_restart_during_active_stream_raises_stream_restarted ... ok
+  test_systemd_client_cancellation_does_not_leave_worker_busy ... ok
+
+  Ran 2 tests in 1.022s
+  OK
+
+
+Command:
+  python3 -m unittest discover -s tests -p 'test_streaming_systemd_auth.py' -v
+
+Output:
+  test_systemd_stream_uses_current_generation_bearer ... ok
+  test_systemd_stream_uses_rotated_secret_after_restart ... ok
+
+  Ran 2 tests in 1.012s
+  OK
+
+
+Systemd Parity Split After P4
+-----------------------------
+Command:
+  python3 -m unittest discover -s tests -p 'test_streaming_systemd_parity.py' -v
+
+Output summary:
+  Ran 8 tests in 2.904s
+  FAILED (failures=1)
+
+Passing after P2/P3/P4:
+  - test_systemd_abnormal_eof_before_terminal_frame_fails_closed
+  - test_systemd_adapter_error_frame_is_not_returned_as_chunk_data
+  - test_systemd_client_cancellation_does_not_leave_worker_busy
+  - test_systemd_first_chunk_timeout_uses_stream_bound
+  - test_systemd_idle_timeout_uses_stream_bound
+  - test_systemd_restart_during_active_stream_raises_stream_restarted
+  - test_systemd_total_timeout_uses_monotonic_absolute_deadline
+
+Remaining expected RED failure:
+  - test_systemd_slow_consumer_has_bounded_behavior
+
+
+Current Dev Repo Change Set
+---------------------------
+Command:
+  git -C /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV status --short
+
+Output:
+  M sydeco_lightml_core/worker.py
+  M sydeco_lightml_core/worker_runtime.py
+  M tests/test_streaming_systemd_auth.py
+  ?? tests/test_streaming_systemd_parity.py
+
+
+P4 Conclusion
+-------------
+P4 is complete.
+
+An active systemd stream is now bound to the worker identity that created it.
+Restart/recycle/stop/credential rotation invalidates the old stream and raises
+StreamRestarted instead of allowing a false completed event. Client/generator
+cancellation now closes the connection and triggers bounded scoped lifecycle
+action on the affected worker.
+
+Next section:
+  P5 should close public protocol correctness gaps and the remaining systemd
+  slow-consumer/backpressure RED test.

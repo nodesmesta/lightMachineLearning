@@ -1,0 +1,144 @@
+PHASE 2 / DAY 4B - P2 SYSTEMD TERMINAL PROTOCOL
+Date: 2026-09-04
+Workspace: /home/sydeco/Dev/Task/week-5/04-09-2026
+Dev repo: /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV
+
+Scope
+-----
+Fix the private worker-to-Core /stream terminal protocol for the
+SystemdTransientWorkerHost production path. This section is intentionally
+limited to frame semantics and fail-closed parsing; streaming deadlines,
+restart invalidation, cancellation, and backpressure remain P3/P4/P5 work.
+
+
+Implementation Summary
+----------------------
+Files changed:
+  sydeco_lightml_core/worker_runtime.py
+  sydeco_lightml_core/worker.py
+  tests/test_streaming_systemd_auth.py
+  tests/test_streaming_systemd_parity.py
+
+Private internal frame model implemented:
+  {"type": "chunk", "data": <adapter chunk>}
+  {"type": "completed"}
+  {"type": "error", "error": {"code": "500", "message": "internal error"}}
+
+Rules implemented:
+  - Adapter chunks are carried only by type=chunk frames.
+  - Normal worker stream completion is explicit: type=completed.
+  - Adapter/runtime stream errors are explicit: type=error.
+  - EOF before completed/error fails closed.
+  - Malformed internal frames fail closed.
+  - Public/internal details stay sanitized; internal adapter exception text is
+    not forwarded by the private stream frame parser.
+
+
+Code References
+---------------
+1. worker_runtime.py now emits explicit stream frames.
+
+File:
+  /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/sydeco_lightml_core/worker_runtime.py
+
+Relevant lines:
+  196-198: _send_stream_frame() writes one JSON frame per NDJSON line.
+  278-280: adapter stream chunks are sent as {"type": "chunk", "data": chunk}
+           and normal completion is sent as {"type": "completed"}.
+  284-291: adapter/runtime stream exceptions are sent as sanitized
+           {"type": "error", "error": {"code": "500", "message":
+           "internal error"}}.
+
+
+2. SystemdTransientWorkerHost.stream() now parses explicit terminal frames.
+
+File:
+  /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/sydeco_lightml_core/worker.py
+
+Relevant lines:
+  1064-1093: parser accepts only dict frames with type=chunk/completed/error;
+             type=chunk yields only obj["data"]; type=completed marks normal
+             terminal success; type=error raises sanitized RuntimeError;
+             EOF without terminal raises protocol error.
+
+
+Targeted Verification
+---------------------
+All verification below was run from an isolated copy:
+  /tmp/sydeco_k5_p2_green
+
+Command:
+  python3 -m py_compile sydeco_lightml_core/worker.py sydeco_lightml_core/worker_runtime.py tests/test_streaming_systemd_auth.py tests/test_streaming_systemd_parity.py
+
+Output:
+  <no output; command exited 0>
+
+
+Command:
+  python3 -m unittest tests.test_streaming_systemd_parity.SystemdStreamingParityTests.test_systemd_adapter_error_frame_is_not_returned_as_chunk_data tests.test_streaming_systemd_parity.SystemdStreamingParityTests.test_systemd_abnormal_eof_before_terminal_frame_fails_closed -v
+
+Output:
+  test_systemd_adapter_error_frame_is_not_returned_as_chunk_data ... ok
+  test_systemd_abnormal_eof_before_terminal_frame_fails_closed ... ok
+
+  Ran 2 tests in 1.015s
+  OK
+
+
+Command:
+  python3 -m unittest discover -s tests -p 'test_streaming_systemd_auth.py' -v
+
+Output:
+  test_systemd_stream_uses_current_generation_bearer ... ok
+  test_systemd_stream_uses_rotated_secret_after_restart ... ok
+
+  Ran 2 tests in 1.012s
+  OK
+
+
+Mixed Streaming Run After P2
+----------------------------
+Command:
+  python3 -m unittest discover -s tests -p 'test_streaming*.py' -v
+
+Output summary:
+  Ran 33 tests in 138.205s
+  FAILED (failures=6)
+
+Interpretation:
+  This mixed run includes the new P1 RED tests. The old 25 streaming tests and
+  the two systemd auth tests pass. The two P2 terminal-protocol tests pass.
+  The six remaining failures are expected RED coverage for later sections:
+    - systemd first-chunk timeout;
+    - systemd idle timeout;
+    - systemd total timeout;
+    - systemd restart during active stream;
+    - systemd client cancellation lifecycle action;
+    - systemd slow-consumer/backpressure behavior.
+
+
+Current Dev Repo Change Set
+---------------------------
+Command:
+  git -C /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV status --short
+
+Output:
+  M sydeco_lightml_core/worker.py
+  M sydeco_lightml_core/worker_runtime.py
+  M tests/test_streaming_systemd_auth.py
+  ?? tests/test_streaming_systemd_parity.py
+
+
+P2 Conclusion
+-------------
+P2 is complete.
+
+The concrete reviewer defect where worker_runtime.py encoded adapter stream
+exceptions as normal {"data": {"error": "internal error"}} has been removed.
+The production-path private stream now has explicit completed/error terminal
+frames, and SystemdTransientWorkerHost.stream() fails closed on abnormal EOF
+before an explicit terminal frame.
+
+Next section:
+  P3 should implement independent systemd stream_first_chunk_timeout,
+  stream_idle_timeout, and stream_total_timeout using monotonic deadlines.

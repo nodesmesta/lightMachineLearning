@@ -1,0 +1,138 @@
+PHASE 2 / DAY 4B - P3 SYSTEMD STREAM TIMEOUTS
+Date: 2026-09-04
+Workspace: /home/sydeco/Dev/Task/week-5/04-09-2026
+Dev repo: /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV
+
+Scope
+-----
+Implement real streaming deadlines on the SystemdTransientWorkerHost production
+path:
+  - stream_first_chunk_timeout;
+  - stream_idle_timeout;
+  - stream_total_timeout.
+
+This section does not close restart/cancellation/backpressure parity; those
+remain P4/P5 work.
+
+
+Implementation Summary
+----------------------
+File changed:
+  sydeco_lightml_core/worker.py
+
+SystemdTransientWorkerHost.stream() now:
+  - reads stream timeout limits from the app manifest resource_limits via the
+    existing _stream_timeouts() helper;
+  - starts a monotonic stream clock with time.monotonic();
+  - computes an absolute total-duration deadline before every frame read;
+  - applies first-chunk timeout before the first stream frame;
+  - applies idle timeout after the first chunk;
+  - applies the smaller of idle/first and remaining total timeout as the socket
+    read timeout;
+  - sets timeout on both the HTTPConnection socket and the HTTPResponse raw
+    socket when available;
+  - closes the connection, audits INFERENCE_TIMEOUT, recycles the affected
+    worker, and raises StreamTimeout(reason, ...) on deadline violation.
+
+
+Code References
+---------------
+File:
+  /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/sydeco_lightml_core/worker.py
+
+Relevant lines:
+  1055-1058: read resource_limits, compute stream timeouts, start monotonic
+             clock, and initialize first-chunk/idle state.
+  1060-1063: derive the timeout reason as total, idle, or first_chunk.
+  1065-1076: timeout handling closes the connection, audits, recycles the
+             affected worker, and raises StreamTimeout with a reason.
+  1078-1084: set read timeout on HTTPConnection and HTTPResponse raw socket.
+  1087-1090: initial HTTP connection uses the smaller of inference timeout,
+             first-chunk timeout, and total timeout.
+  1098-1107: before each frame read, enforce monotonic total deadline and set
+             the active first/idle read timeout.
+  1123-1126: first chunk switches the stream from first-chunk timeout to idle
+             timeout mode.
+
+
+Targeted Verification
+---------------------
+All verification below was run from an isolated copy:
+  /tmp/sydeco_k5_p3_green
+
+Command:
+  python3 -m py_compile sydeco_lightml_core/worker.py sydeco_lightml_core/worker_runtime.py tests/test_streaming_systemd_parity.py
+
+Output:
+  <no output; command exited 0>
+
+
+Command:
+  python3 -m unittest tests.test_streaming_systemd_parity.SystemdStreamingParityTests.test_systemd_first_chunk_timeout_uses_stream_bound tests.test_streaming_systemd_parity.SystemdStreamingParityTests.test_systemd_idle_timeout_uses_stream_bound tests.test_streaming_systemd_parity.SystemdStreamingParityTests.test_systemd_total_timeout_uses_monotonic_absolute_deadline -v
+
+Output:
+  test_systemd_first_chunk_timeout_uses_stream_bound ... ok
+  test_systemd_idle_timeout_uses_stream_bound ... ok
+  test_systemd_total_timeout_uses_monotonic_absolute_deadline ... ok
+
+  Ran 3 tests in 0.372s
+  OK
+
+
+Command:
+  python3 -m unittest discover -s tests -p 'test_streaming_systemd_auth.py' -v
+
+Output:
+  test_systemd_stream_uses_current_generation_bearer ... ok
+  test_systemd_stream_uses_rotated_secret_after_restart ... ok
+
+  Ran 2 tests in 1.016s
+  OK
+
+
+Systemd Parity Split After P3
+-----------------------------
+Command:
+  python3 -m unittest discover -s tests -p 'test_streaming_systemd_parity.py' -v
+
+Output summary:
+  Ran 8 tests in 3.405s
+  FAILED (failures=3)
+
+Passing after P2/P3:
+  - test_systemd_abnormal_eof_before_terminal_frame_fails_closed
+  - test_systemd_adapter_error_frame_is_not_returned_as_chunk_data
+  - test_systemd_first_chunk_timeout_uses_stream_bound
+  - test_systemd_idle_timeout_uses_stream_bound
+  - test_systemd_total_timeout_uses_monotonic_absolute_deadline
+
+Remaining expected RED failures for later sections:
+  - test_systemd_client_cancellation_does_not_leave_worker_busy
+  - test_systemd_restart_during_active_stream_raises_stream_restarted
+  - test_systemd_slow_consumer_has_bounded_behavior
+
+
+Current Dev Repo Change Set
+---------------------------
+Command:
+  git -C /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV status --short
+
+Output:
+  M sydeco_lightml_core/worker.py
+  M sydeco_lightml_core/worker_runtime.py
+  M tests/test_streaming_systemd_auth.py
+  ?? tests/test_streaming_systemd_parity.py
+
+
+P3 Conclusion
+-------------
+P3 is complete.
+
+SystemdTransientWorkerHost.stream() now enforces first-chunk, idle, and total
+stream deadlines independently from the ordinary inference timeout. The total
+deadline is monotonic and absolute, so a worker cannot stream indefinitely by
+emitting chunks within the ordinary socket inactivity timeout.
+
+Next section:
+  P4 should close lifecycle/restart and client-cancellation parity on the
+  SystemdTransientWorkerHost production path.

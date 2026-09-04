@@ -1,0 +1,164 @@
+PHASE 2 / DAY 4B - P1 SYSTEMD K5 RED TESTS
+Date: 2026-09-04
+Workspace: /home/sydeco/Dev/Task/week-5/04-09-2026
+Dev repo: /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV
+
+Scope
+-----
+Add focused RED tests for K5 production-path parity. These tests exercise
+SystemdTransientWorkerHost directly and do not modify production code.
+
+
+Files Added
+-----------
+  /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/tests/test_streaming_systemd_parity.py
+
+The new test file uses:
+  - SystemdTransientWorkerHost as the host under test;
+  - fake subprocess.run for systemd-run/systemctl calls;
+  - a local loopback ThreadingHTTPServer as the worker process endpoint;
+  - JsonlAuditBackend and ReadinessStore, matching the existing systemd auth
+    test pattern.
+
+This keeps the test isolated from real systemd while still exercising the
+production-path host class and HTTP worker stream behavior.
+
+
+RED Test Cases Added
+--------------------
+1. test_systemd_first_chunk_timeout_uses_stream_bound
+   Requirement:
+     A worker that never emits the first chunk within
+     stream_first_chunk_timeout must terminate with StreamTimeout(reason=
+     "first_chunk").
+
+2. test_systemd_idle_timeout_uses_stream_bound
+   Requirement:
+     A worker that emits one chunk and then stalls beyond stream_idle_timeout
+     must terminate with StreamTimeout(reason="idle").
+
+3. test_systemd_total_timeout_uses_monotonic_absolute_deadline
+   Requirement:
+     A worker that keeps sending chunks within the socket inactivity timeout
+     must still be stopped by stream_total_timeout.
+
+4. test_systemd_adapter_error_frame_is_not_returned_as_chunk_data
+   Requirement:
+     An adapter/runtime error encoded as internal error must not be yielded as
+     normal chunk data.
+
+5. test_systemd_abnormal_eof_before_terminal_frame_fails_closed
+   Requirement:
+     EOF before an explicit completed/error terminal frame must fail closed.
+
+6. test_systemd_restart_during_active_stream_raises_stream_restarted
+   Requirement:
+     Restart during an active systemd stream must invalidate the old stream and
+     raise StreamRestarted instead of completing normally.
+
+7. test_systemd_client_cancellation_does_not_leave_worker_busy
+   Requirement:
+     Client cancellation must trigger bounded lifecycle action on the affected
+     worker instead of leaving the production worker stream unmanaged.
+
+8. test_systemd_slow_consumer_has_bounded_behavior
+   Requirement:
+     A slow consumer must not result in silent unbounded/indefinite systemd
+     stream behavior.
+
+
+Isolated RED Run
+----------------
+The RED run was executed from a fresh isolated copy:
+  /tmp/sydeco_k5_p1_red
+
+Command:
+  python3 -m unittest discover -s tests -p 'test_streaming_systemd_parity.py' -v
+
+Output summary:
+  Ran 8 tests in 5.055s
+  FAILED (failures=7, errors=1)
+
+Observed failures/errors:
+
+  ERROR: test_systemd_abnormal_eof_before_terminal_frame_fails_closed
+    StopIteration
+    Baseline behavior: EOF ends the generator normally instead of failing
+    closed.
+
+  FAIL: test_systemd_adapter_error_frame_is_not_returned_as_chunk_data
+    AssertionError: RuntimeError not raised
+    Baseline behavior: {"data": {"error": "internal error"}} is yielded as
+    normal chunk data.
+
+  FAIL: test_systemd_client_cancellation_does_not_leave_worker_busy
+    AssertionError: no systemctl stop/kill call observed
+    Baseline behavior: closing the client-side generator does not trigger a
+    bounded production-worker lifecycle action.
+
+  FAIL: test_systemd_first_chunk_timeout_uses_stream_bound
+    AssertionError: StreamTimeout not raised
+    Baseline behavior: stream_first_chunk_timeout is not enforced by
+    SystemdTransientWorkerHost.stream().
+
+  FAIL: test_systemd_idle_timeout_uses_stream_bound
+    AssertionError: StreamTimeout not raised
+    Baseline behavior: stream_idle_timeout is not enforced by
+    SystemdTransientWorkerHost.stream().
+
+  FAIL: test_systemd_restart_during_active_stream_raises_stream_restarted
+    AssertionError: StreamRestarted not raised
+    Baseline behavior: stream identity/generation invalidation is not enforced
+    during an active systemd stream.
+
+  FAIL: test_systemd_slow_consumer_has_bounded_behavior
+    AssertionError: Exception not raised
+    Baseline behavior: slow-consumer/backpressure behavior is not bounded or
+    surfaced by SystemdTransientWorkerHost.stream().
+
+  FAIL: test_systemd_total_timeout_uses_monotonic_absolute_deadline
+    AssertionError: StreamTimeout not raised
+    Baseline behavior: stream_total_timeout is not enforced by a monotonic
+    absolute deadline.
+
+
+Control Check
+-------------
+Before this P1 step, the existing isolated streaming baseline was:
+  python3 -m unittest discover -s tests -p 'test_streaming*.py' -v
+  Ran 25 tests in 141.727s
+  OK
+
+Therefore, the P1 failures are new RED coverage for reviewer-identified
+production-path gaps, not a regression in the pre-existing K5 test suite.
+
+
+Current Dev Repo Change Set
+---------------------------
+Command:
+  git -C /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV status --short
+
+Output:
+  ?? tests/test_streaming_systemd_parity.py
+
+No production code has been changed in P1.
+
+
+P1 Conclusion
+-------------
+P1 is complete as RED coverage.
+
+The new tests confirm that the current baseline lacks systemd production-path
+parity for:
+  - first-chunk timeout;
+  - idle timeout;
+  - total stream duration timeout;
+  - adapter error framing;
+  - abnormal EOF fail-closed behavior;
+  - restart invalidation during active stream;
+  - bounded cancellation lifecycle action;
+  - slow-consumer/backpressure behavior.
+
+Next section:
+  P2 should fix the private worker-to-Core streaming terminal protocol before
+  changing broader timeout/lifecycle behavior.

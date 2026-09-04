@@ -1,0 +1,193 @@
+PHASE 2 / DAY 4B - P5 STREAM PROTOCOL CORRECTNESS
+Date: 2026-09-04
+Workspace: /home/sydeco/Dev/Task/week-5/04-09-2026
+Dev repo: /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV
+
+Scope
+-----
+Close the smaller public protocol correctness gaps and the remaining
+SystemdTransientWorkerHost slow-consumer/backpressure RED test.
+
+Covered in this section:
+  - streaming batch requests are rejected explicitly;
+  - unsupported streaming returns a deterministic controlled outcome;
+  - systemd slow-consumer behavior is bounded and observable.
+
+
+Implementation Summary
+----------------------
+Files changed:
+  sydeco_lightml_core/server.py
+  sydeco_lightml_core/worker.py
+  tests/test_streaming_contract.py
+  tests/test_streaming_systemd_parity.py
+
+Public protocol corrections:
+  - Core now rejects Accept: application/x-ndjson requests with {"inputs": [...]}
+    at the edge with HTTP 400 JSON before invoking host.stream().
+  - Unsupported streaming is mapped to a controlled NDJSON worker_error with
+    code 400 and message "streaming not supported".
+
+Production-path slow-consumer correction:
+  - SystemdTransientWorkerHost.stream() reads stream_backpressure_timeout from
+    resource_limits.
+  - After yielding a chunk, it measures how long the consumer takes to request
+    the next item.
+  - If the consumer stalls beyond stream_backpressure_timeout, it closes the
+    worker connection and raises StreamBackpressure instead of continuing
+    silently.
+
+
+Code References
+---------------
+1. Public batch-stream rejection.
+
+File:
+  /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/sydeco_lightml_core/server.py
+
+Relevant lines:
+  290-302: if Accept requests NDJSON and the request is batch, Core audits
+           "streaming batch unsupported" and returns HTTP 400 JSON with
+           "streaming batch requests are not supported" before calling
+           _handle_stream_infer().
+
+
+2. Controlled unsupported streaming outcome.
+
+Files:
+  /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/sydeco_lightml_core/worker.py
+  /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/sydeco_lightml_core/server.py
+
+Relevant lines:
+  worker.py 136-137: StreamUnsupported exception type.
+  worker.py 315-317: InProcessWorkerHost raises StreamUnsupported when an
+                     adapter has no stream() method.
+  worker.py 1124-1132: SystemdTransientWorkerHost maps worker-runtime HTTP 400
+                       "streaming not supported by app" to StreamUnsupported.
+  server.py 434-441: StreamUnsupported becomes NDJSON worker_error code 400
+                     with message "streaming not supported".
+
+
+3. Systemd slow-consumer/backpressure behavior.
+
+File:
+  /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/sydeco_lightml_core/worker.py
+
+Relevant lines:
+  1059-1065: stream_backpressure_timeout is read from resource_limits.
+  1167-1181: after yielding a chunk, Core measures consumer stall duration;
+             if the stall exceeds stream_backpressure_timeout, the connection
+             is closed and StreamBackpressure is raised.
+
+
+4. P5 tests.
+
+File:
+  /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/tests/test_streaming_contract.py
+
+Relevant lines:
+  305-329: test_streaming_batch_request_is_rejected_before_worker.
+  331-350: test_streaming_unsupported_app_returns_controlled_error.
+
+File:
+  /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/tests/test_streaming_systemd_parity.py
+
+Relevant test:
+  test_systemd_slow_consumer_has_bounded_behavior.
+
+
+Targeted Verification
+---------------------
+All verification below was run from an isolated copy:
+  /tmp/sydeco_k5_p5_green
+
+Command:
+  python3 -m py_compile sydeco_lightml_core/worker.py sydeco_lightml_core/worker_runtime.py sydeco_lightml_core/server.py tests/test_streaming_contract.py tests/test_streaming_systemd_parity.py tests/test_streaming_systemd_auth.py
+
+Output:
+  <no output; command exited 0>
+
+
+Command:
+  python3 -m unittest tests.test_streaming_contract.StreamingContractTests.test_streaming_batch_request_is_rejected_before_worker tests.test_streaming_contract.StreamingContractTests.test_streaming_unsupported_app_returns_controlled_error -v
+
+Output:
+  test_streaming_batch_request_is_rejected_before_worker ... ok
+  test_streaming_unsupported_app_returns_controlled_error ... ok
+
+  Ran 2 tests in 10.106s
+  OK
+
+
+Command:
+  python3 -m unittest discover -s tests -p 'test_streaming_systemd_parity.py' -v
+
+Output:
+  test_systemd_abnormal_eof_before_terminal_frame_fails_closed ... ok
+  test_systemd_adapter_error_frame_is_not_returned_as_chunk_data ... ok
+  test_systemd_client_cancellation_does_not_leave_worker_busy ... ok
+  test_systemd_first_chunk_timeout_uses_stream_bound ... ok
+  test_systemd_idle_timeout_uses_stream_bound ... ok
+  test_systemd_restart_during_active_stream_raises_stream_restarted ... ok
+  test_systemd_slow_consumer_has_bounded_behavior ... ok
+  test_systemd_total_timeout_uses_monotonic_absolute_deadline ... ok
+
+  Ran 8 tests in 2.909s
+  OK
+
+
+Command:
+  python3 -m unittest discover -s tests -p 'test_streaming_systemd_auth.py' -v
+
+Output:
+  test_systemd_stream_uses_current_generation_bearer ... ok
+  test_systemd_stream_uses_rotated_secret_after_restart ... ok
+
+  Ran 2 tests in 1.017s
+  OK
+
+
+Full Streaming Verification
+---------------------------
+Command:
+  python3 -m unittest discover -s tests -p 'test_streaming*.py' -v
+
+Output summary:
+  Ran 35 tests in 144.783s
+  OK
+
+Interpretation:
+  The K5 streaming suite now includes:
+    - the previous 25 streaming tests;
+    - 8 new SystemdTransientWorkerHost parity tests;
+    - 2 new public protocol correctness tests.
+
+All are passing after P5.
+
+
+Current Dev Repo Change Set
+---------------------------
+Command:
+  git -C /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV status --short
+
+Output:
+  M sydeco_lightml_core/server.py
+  M sydeco_lightml_core/worker.py
+  M sydeco_lightml_core/worker_runtime.py
+  M tests/test_streaming_contract.py
+  M tests/test_streaming_systemd_auth.py
+  ?? tests/test_streaming_systemd_parity.py
+
+
+P5 Conclusion
+-------------
+P5 is complete.
+
+The public stream protocol no longer silently processes only items[0] for
+batch requests. Unsupported streaming now has a deterministic controlled
+outcome. The remaining systemd slow-consumer/backpressure parity test is green,
+and the full streaming test surface passes at 35/35.
+
+Next section:
+  P6 should run the targeted K5 parity/security verification and prove the split
+  between existing in-process tests and new SystemdTransientWorkerHost tests.

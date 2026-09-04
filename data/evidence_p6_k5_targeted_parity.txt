@@ -1,0 +1,200 @@
+PHASE 2 / DAY 4B - P6 K5 TARGETED PARITY VERIFICATION
+Date: 2026-09-04
+Workspace: /home/sydeco/Dev/Task/week-5/04-09-2026
+Dev repo: /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV
+
+Scope
+-----
+Run targeted K5 parity/security verification after P2-P5 are green.
+
+This evidence separates:
+  - existing in-process/dev-host K5 coverage;
+  - existing systemd stream authentication coverage;
+  - new SystemdTransientWorkerHost production-path parity coverage;
+  - public protocol correctness coverage.
+
+
+Isolated Verification Area
+--------------------------
+All commands in this section were run from:
+  /tmp/sydeco_k5_p6_verify
+
+The isolated copy was made from the current dev repo state after P5.
+Test artifacts such as __pycache__ were confined to /tmp and did not touch the
+dev repo.
+
+
+Compile Check
+-------------
+Command:
+  python3 -m py_compile sydeco_lightml_core/worker.py sydeco_lightml_core/worker_runtime.py sydeco_lightml_core/server.py tests/test_streaming_contract.py tests/test_streaming_systemd_parity.py tests/test_streaming_systemd_auth.py tests/test_streaming_timeout.py tests/test_streaming_cancellation.py tests/test_streaming_backpressure.py tests/test_streaming_isolation.py tests/test_streaming_security.py
+
+Output:
+  <no output; command exited 0>
+
+Result:
+  PASS
+
+
+New Systemd Production-Path Parity Tests
+----------------------------------------
+Command:
+  python3 -m unittest discover -s tests -p 'test_streaming_systemd_parity.py' -v
+
+Output:
+  test_systemd_abnormal_eof_before_terminal_frame_fails_closed ... ok
+  test_systemd_adapter_error_frame_is_not_returned_as_chunk_data ... ok
+  test_systemd_client_cancellation_does_not_leave_worker_busy ... ok
+  test_systemd_first_chunk_timeout_uses_stream_bound ... ok
+  test_systemd_idle_timeout_uses_stream_bound ... ok
+  test_systemd_restart_during_active_stream_raises_stream_restarted ... ok
+  test_systemd_slow_consumer_has_bounded_behavior ... ok
+  test_systemd_total_timeout_uses_monotonic_absolute_deadline ... ok
+
+  Ran 8 tests in 2.903s
+  OK
+
+Result:
+  PASS
+
+Coverage:
+  - systemd first-chunk timeout;
+  - systemd idle timeout;
+  - systemd total stream deadline;
+  - explicit error frame handling;
+  - abnormal EOF fail-closed behavior;
+  - restart during active stream;
+  - client cancellation lifecycle action;
+  - slow-consumer/backpressure bounded behavior.
+
+
+Systemd Stream Authentication Tests
+-----------------------------------
+Command:
+  python3 -m unittest discover -s tests -p 'test_streaming_systemd_auth.py' -v
+
+Output:
+  test_systemd_stream_uses_current_generation_bearer ... ok
+  test_systemd_stream_uses_rotated_secret_after_restart ... ok
+
+  Ran 2 tests in 1.018s
+  OK
+
+Result:
+  PASS
+
+Coverage:
+  - systemd stream forwards the current per-generation worker credential;
+  - stream uses the rotated credential after restart.
+
+
+Public Streaming Contract And Correctness Tests
+-----------------------------------------------
+Command:
+  python3 -m unittest discover -s tests -p 'test_streaming_contract.py' -v
+
+Output summary:
+  Ran 8 tests in 40.934s
+  OK
+
+Result:
+  PASS
+
+Coverage:
+  - accepted/chunk/completed NDJSON contract;
+  - edge auth rejects missing token before worker;
+  - edge auth rejects wrong token before worker;
+  - old public token rejected after token rotation;
+  - malicious adapter newlines cannot forge protocol frames;
+  - stream error response does not leak the presented token;
+  - streaming batch requests are rejected before worker;
+  - unsupported streaming returns controlled worker_error code 400.
+
+
+Full Targeted K5 Streaming Suite
+--------------------------------
+Command:
+  python3 -m unittest discover -s tests -p 'test_streaming*.py' -v
+
+Output summary:
+  Ran 35 tests in 145.176s
+  OK
+
+Result:
+  PASS
+
+Coverage split:
+  - previous K5 streaming tests from 03-09: 25 tests;
+  - new SystemdTransientWorkerHost parity tests: 8 tests;
+  - new public protocol correctness tests: 2 tests;
+  - total targeted K5 streaming tests after P5: 35 tests.
+
+Note:
+  A non-fatal ResourceWarning was printed during one restart-path run:
+    ResourceWarning: unclosed <socket.socket ...>
+  The test result remained OK. This warning is not treated as K5 parity failure
+  in P6, but should be watched during P7 full regression output review.
+
+
+Secret/Token Evidence Scan
+--------------------------
+Command:
+  rg -n "Bearer [A-Za-z0-9._~-]+|[a-f0-9]{64}|n2n2n2" /home/sydeco/Dev/Task/week-5/04-09-2026/data || true
+
+Output:
+  /home/sydeco/Dev/Task/week-5/04-09-2026/data/evidence_p0_systemd_k5_baseline.txt:185:    Covered: systemd stream forwards current per-generation Bearer credential;
+
+Interpretation:
+  The scan found documentation text only. It did not find a concrete Bearer
+  token value, 64-hex token material, or the test token marker.
+
+
+Isolated Artifact Check
+-----------------------
+Command:
+  find /tmp/sydeco_k5_p6_verify -name '__pycache__' -o -name '.pytest_cache' | head -50
+
+Output:
+  /tmp/sydeco_k5_p6_verify/tests/__pycache__
+  /tmp/sydeco_k5_p6_verify/sydeco_lightml_core/__pycache__
+  /tmp/sydeco_k5_p6_verify/examples/dummy-app/adapter/__pycache__
+  /tmp/sydeco_k5_p6_verify/examples/text-classifier/adapter/__pycache__
+  /tmp/sydeco_k5_p6_verify/examples/image-classifier/adapter/__pycache__
+  /tmp/sydeco_k5_p6_verify/examples/document-triage/adapter/__pycache__
+
+Interpretation:
+  Test-generated cache artifacts are confined to /tmp. They are not in the dev
+  repo change set and must not be included in the final package.
+
+
+Current Dev Repo Change Set
+---------------------------
+Command:
+  git -C /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV status --short
+
+Output:
+  M sydeco_lightml_core/server.py
+  M sydeco_lightml_core/worker.py
+  M sydeco_lightml_core/worker_runtime.py
+  M tests/test_streaming_contract.py
+  M tests/test_streaming_systemd_auth.py
+  ?? tests/test_streaming_systemd_parity.py
+
+
+P6 Conclusion
+-------------
+P6 is complete.
+
+The targeted K5 surface now passes at 35/35 from an isolated copy. The result
+keeps the distinction required by the reviewer:
+  - in-process/dev-host tests still pass;
+  - systemd stream authentication still passes;
+  - new SystemdTransientWorkerHost production-path parity tests pass;
+  - public protocol correctness tests pass.
+
+No concrete token material was found in the evidence scan.
+
+Next section:
+  P7 should run full regression, fresh-extraction regression, py_compile at
+  repository scope, clean-state/package hygiene checks, and broader non-K5
+  regression proof.
