@@ -193,8 +193,8 @@ class WorkerHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_ndjson_data(self, obj: Any) -> None:
-        self.wfile.write(json.dumps({"data": obj}).encode("utf-8") + b"\n")
+    def _send_stream_frame(self, frame: Dict[str, Any]) -> None:
+        self.wfile.write(json.dumps(frame).encode("utf-8") + b"\n")
         self.wfile.flush()
 
     def _error(self, code: int, message: str) -> None:
@@ -276,7 +276,8 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     self.send_header("Connection", "close")
                     self.end_headers()
                     for chunk in stream_fn(request, context):
-                        self._send_ndjson_data(chunk)
+                        self._send_stream_frame({"type": "chunk", "data": chunk})
+                    self._send_stream_frame({"type": "completed"})
                     self.close_connection = True
                     return
                 result = runtime.adapter.infer(request, context)
@@ -284,7 +285,10 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 log.exception("adapter.%s failed", "stream" if path == "/stream" else "infer")
                 if path == "/stream":
                     try:
-                        self._send_ndjson_data({"error": "internal error"})
+                        self._send_stream_frame({
+                            "type": "error",
+                            "error": {"code": "500", "message": "internal error"},
+                        })
                     except Exception:
                         pass
                 else:

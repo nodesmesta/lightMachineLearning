@@ -302,6 +302,53 @@ class Adapter:
             audit_blob = fh.read()
         self.assertNotIn(token, audit_blob)
 
+    def test_streaming_batch_request_is_rejected_before_worker(self) -> None:
+        adapter_src = """\
+class Adapter:
+    def initialize(self, context):
+        pass
+
+    def infer(self, request, context):
+        return {"label": "single"}
+
+    def stream(self, request, context):
+        raise AssertionError("streaming batch must be rejected before worker")
+"""
+        core, token = self._install_streaming_app(adapter_src)
+
+        status, content_type, events, raw = self._stream_request(
+            core,
+            "stream-app",
+            {"inputs": [{"text": "one"}, {"text": "two"}]},
+            token,
+        )
+
+        self.assertEqual(status, 400, raw)
+        self.assertIn("application/json", content_type)
+        self.assertEqual(events[0]["error"]["code"], "400")
+        self.assertEqual(events[0]["error"]["message"], "streaming batch requests are not supported")
+
+    def test_streaming_unsupported_app_returns_controlled_error(self) -> None:
+        adapter_src = """\
+class Adapter:
+    def initialize(self, context):
+        pass
+
+    def infer(self, request, context):
+        return {"label": "single"}
+"""
+        core, token = self._install_streaming_app(adapter_src)
+
+        status, content_type, events, raw = self._stream_request(
+            core, "stream-app", {"text": "hello"}, token
+        )
+
+        self.assertEqual(status, 200, raw)
+        self.assertIn("application/x-ndjson", content_type)
+        self.assertEqual([event["event"] for event in events], ["accepted", "worker_error"])
+        self.assertEqual(events[1]["code"], "400")
+        self.assertEqual(events[1]["message"], "streaming not supported")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -34,6 +34,7 @@ from .worker import (
     StreamBackpressure,
     StreamRestarted,
     StreamTimeout,
+    StreamUnsupported,
     WorkerNotReady,
 )
 
@@ -288,6 +289,16 @@ class CoreHandler(BaseHTTPRequestHandler):
 
         wants_stream = "application/x-ndjson" in self.headers.get("Accept", "")
         if wants_stream:
+            if batch:
+                self._audit(app_id, request_id, "fail", 0, 400, "streaming batch unsupported")
+                self._send_json(400, {
+                    "error": {
+                        "code": "400",
+                        "message": "streaming batch requests are not supported",
+                    },
+                    "request_id": request_id,
+                })
+                return
             self._handle_stream_infer(app_id, version, request_id, started, items[0])
             return
 
@@ -419,6 +430,14 @@ class CoreHandler(BaseHTTPRequestHandler):
                 "event": "worker_error",
                 "code": "429",
                 "message": "stream backpressure",
+            })
+        except StreamUnsupported:
+            self._audit(app_id, request_id, "fail", 0, 400, "streaming not supported")
+            self._send_ndjson_event({
+                **base,
+                "event": "worker_error",
+                "code": "400",
+                "message": "streaming not supported",
             })
         except StreamRestarted:
             duration_ms = int((time.time() - started) * 1000)

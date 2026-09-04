@@ -68,7 +68,8 @@ class _StreamingWorkerServer:
                 self.send_header("Content-Type", "application/x-ndjson")
                 self.send_header("Connection", "close")
                 self.end_headers()
-                self.wfile.write(json.dumps({"data": {"label": "systemd-stream"}}).encode("utf-8") + b"\n")
+                self.wfile.write(json.dumps({"type": "chunk", "data": {"label": "systemd-stream"}}).encode("utf-8") + b"\n")
+                self.wfile.write(json.dumps({"type": "completed"}).encode("utf-8") + b"\n")
                 self.close_connection = True
 
         return Handler

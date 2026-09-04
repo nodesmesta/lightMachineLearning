@@ -133,6 +133,10 @@ class StreamRestarted(Exception):
     """
 
 
+class StreamUnsupported(Exception):
+    """K5: the application does not implement streaming inference."""
+
+
 def _stream_timeouts(resource_limits: Dict[str, Any], default_timeout: float) -> Dict[str, float]:
     """Return K5 stream timeout bounds with M4 fallback semantics."""
     def _get(name: str) -> float:
@@ -310,7 +314,7 @@ class InProcessWorkerHost(WorkerHost):
             bp_timeout: Optional[float] = bp_value if bp_value > 0.0 else None
         stream_fn = getattr(adapter, "stream", None)
         if stream_fn is None:
-            raise RuntimeError("streaming not supported by app")
+            raise StreamUnsupported("streaming not supported")
 
         chunks: queue.Queue = queue.Queue(maxsize=buffer_size)
         abort: queue.Queue = queue.Queue(maxsize=1)
@@ -1052,16 +1056,93 @@ class SystemdTransientWorkerHost(WorkerHost):
         if self._secret is not None:
             headers["Authorization"] = "Bearer " + self._secret
         conn = None
+        limits = self._last_context.get("config", {}).get("resource_limits", {})
+        timeouts = _stream_timeouts(limits, self._timeout)
+        try:
+            bp_value = float(limits.get("stream_backpressure_timeout", 0.0))
+        except (TypeError, ValueError):
+            bp_value = 0.0
+        bp_timeout = bp_value if bp_value > 0.0 else None
+        started = time.monotonic()
+        seen = False
+        stream_unit = self._unit
+        stream_launch_count = self._launch_count
+        stream_secret = self._secret
+
+        def _stream_timeout_reason() -> str:
+            if time.monotonic() - started >= timeouts["total"]:
+                return "total"
+            return "idle" if seen else "first_chunk"
+
+        def _raise_stream_timeout(reason: str) -> None:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._audit_event(
+                "INFERENCE_TIMEOUT",
+                detail=f"stream {reason} timeout",
+            )
+            self._recycle_after_timeout()
+            raise StreamTimeout(reason, f"stream {reason} timeout: {self._app_id}")
+
+        def _stream_stale() -> bool:
+            return (
+                not self._started
+                or self._unit != stream_unit
+                or self._launch_count != stream_launch_count
+                or self._secret != stream_secret
+            )
+
+        def _raise_stream_restarted() -> None:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            raise StreamRestarted(
+                f"worker generation recycled during stream: {self._app_id}"
+            )
+
+        def _set_read_timeout(resp, timeout_value: float) -> None:
+            if conn is not None and conn.sock is not None:
+                conn.sock.settimeout(timeout_value)
+            raw = getattr(getattr(resp, "fp", None), "raw", None)
+            sock = getattr(raw, "_sock", None)
+            if sock is not None:
+                sock.settimeout(timeout_value)
+
         try:
             conn = http.client.HTTPConnection(
-                "127.0.0.1", self._port, timeout=self._timeout
+                "127.0.0.1",
+                self._port,
+                timeout=min(self._timeout, timeouts["first_chunk"], timeouts["total"]),
             )
             conn.request("POST", "/stream", body=body, headers=headers)
             resp = conn.getresponse()
             if resp.status != 200:
                 data = resp.read()
+                try:
+                    err = json.loads(data.decode("utf-8")).get("error", {})
+                except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
+                    err = {}
+                if resp.status == 400 and err.get("message") == "streaming not supported by app":
+                    raise StreamUnsupported("streaming not supported")
                 raise RuntimeError(f"worker stream error {resp.status}: {data!r}")
+            terminal = False
             while True:
+                if _stream_stale():
+                    _raise_stream_restarted()
+                elapsed = time.monotonic() - started
+                remaining_total = timeouts["total"] - elapsed
+                if remaining_total <= 0:
+                    _raise_stream_timeout("total")
+                read_timeout = min(
+                    timeouts["idle"] if seen else timeouts["first_chunk"],
+                    remaining_total,
+                )
+                _set_read_timeout(resp, read_timeout)
                 line = resp.readline()
                 if not line:
                     break
@@ -1074,25 +1155,55 @@ class SystemdTransientWorkerHost(WorkerHost):
                     raise WorkerNotReady(
                         f"worker returned invalid stream response: {self._app_id}"
                     ) from exc
-                if "data" in obj:
+                if not isinstance(obj, dict):
+                    raise RuntimeError("worker stream protocol error")
+                frame_type = obj.get("type")
+                if frame_type == "chunk":
+                    if "data" not in obj:
+                        raise RuntimeError("worker stream protocol error")
+                    if _stream_stale():
+                        _raise_stream_restarted()
+                    seen = True
+                    before_yield = time.monotonic()
                     yield obj["data"]
-                elif "error" in obj:
-                    raise RuntimeError(f"worker stream error: {obj['error']}")
+                    if (
+                        bp_timeout is not None
+                        and time.monotonic() - before_yield > bp_timeout
+                    ):
+                        if conn is not None:
+                            try:
+                                conn.close()
+                            except Exception:
+                                pass
+                        raise StreamBackpressure(
+                            "stream backpressure: consumer stalled beyond "
+                            f"stream_backpressure_timeout: {self._app_id}"
+                        )
+                    if _stream_stale():
+                        _raise_stream_restarted()
+                elif frame_type == "completed":
+                    if _stream_stale():
+                        _raise_stream_restarted()
+                    terminal = True
+                    break
+                elif frame_type == "error":
+                    raise RuntimeError("worker stream error: internal error")
+                else:
+                    raise RuntimeError("worker stream protocol error")
+            if not terminal:
+                raise RuntimeError("worker stream ended before terminal frame")
             conn.close()
         except socket.timeout:
+            _raise_stream_timeout(_stream_timeout_reason())
+        except GeneratorExit:
             if conn is not None:
                 try:
                     conn.close()
                 except Exception:
                     pass
-            self._audit_event(
-                "INFERENCE_TIMEOUT",
-                detail=f"stream no response within {self._timeout:.0f}s",
-            )
+            self._audit_event("STREAM_CANCELLED", detail="client disconnected")
             self._recycle_after_timeout()
-            raise InferenceTimeout(
-                f"stream timeout after {self._timeout:.0f}s: {self._app_id}"
-            )
+            raise
         except (ConnectionRefusedError, ConnectionResetError, OSError) as exc:
             raise WorkerNotReady(f"worker unreachable: {self._app_id}") from exc
         finally:
