@@ -1,0 +1,99 @@
+PHASE 2 / DAY 4C - P3 SYSTEMD PARITY TARGETED VERIFICATION
+Date: 2026-09-07
+Scope: targeted K5 systemd parity verification after P2 lifecycle fix
+
+Repository state before P3 run
+==============================
+
+Command:
+  git -C /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV rev-parse --short HEAD
+
+Output:
+  4af8808
+
+Command:
+  git -C /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV rev-list --count HEAD
+
+Output:
+  23
+
+Command:
+  git -C /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV status --short
+
+Output:
+  <no output; working tree clean before evidence write>
+
+Systemd parity test count
+=========================
+
+Command:
+  rg -c "^    def test_" /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/tests/test_streaming_systemd_parity.py
+
+Output:
+  11
+
+Backpressure assertion check
+============================
+
+Command:
+  rg -n "assertRaises\\(StreamBackpressure\\)|assertRaises\\(Exception\\)" /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/tests/test_streaming_systemd_parity.py
+
+Output:
+  499:        with self.assertRaises(StreamBackpressure):
+
+Targeted GREEN command
+======================
+
+Command:
+  python3 -m unittest discover -s tests -p 'test_streaming_systemd_parity.py' -v
+
+Output:
+  test_systemd_abnormal_eof_before_terminal_frame_fails_closed (test_streaming_systemd_parity.SystemdStreamingParityTests) ... ok
+  test_systemd_adapter_error_frame_is_not_returned_as_chunk_data (test_streaming_systemd_parity.SystemdStreamingParityTests) ... ok
+  test_systemd_client_cancellation_does_not_leave_worker_busy (test_streaming_systemd_parity.SystemdStreamingParityTests) ... ok
+  test_systemd_concurrent_restart_during_blocked_read_raises_stream_restarted (test_streaming_systemd_parity.SystemdStreamingParityTests) ... ok
+  test_systemd_first_chunk_timeout_uses_stream_bound (test_streaming_systemd_parity.SystemdStreamingParityTests) ... ok
+  test_systemd_idle_timeout_uses_stream_bound (test_streaming_systemd_parity.SystemdStreamingParityTests) ... /usr/lib/python3.10/threading.py:247: ResourceWarning: unclosed <socket.socket [closed] fd=4, family=AddressFamily.AF_INET, type=SocketKind.SOCK_STREAM, proto=6>
+    self._release_save = lock._release_save
+  ResourceWarning: Enable tracemalloc to get the object allocation traceback
+  ok
+  test_systemd_restart_during_active_stream_raises_stream_restarted (test_streaming_systemd_parity.SystemdStreamingParityTests) ... ok
+  test_systemd_restart_followed_by_eof_raises_stream_restarted (test_streaming_systemd_parity.SystemdStreamingParityTests) ... ok
+  test_systemd_restart_followed_by_transport_failure_raises_stream_restarted (test_streaming_systemd_parity.SystemdStreamingParityTests) ... ok
+  test_systemd_slow_consumer_has_bounded_behavior (test_streaming_systemd_parity.SystemdStreamingParityTests) ... ok
+  test_systemd_total_timeout_uses_monotonic_absolute_deadline (test_streaming_systemd_parity.SystemdStreamingParityTests) ... ok
+
+  ----------------------------------------------------------------------
+  Ran 11 tests in 4.437s
+
+  OK
+
+P3 coverage confirmation
+========================
+
+Systemd parity coverage now includes:
+- first chunk timeout;
+- idle timeout;
+- total timeout;
+- adapter error frame handling;
+- abnormal EOF fail-closed behavior;
+- restart during active stream;
+- deterministic concurrent restart during blocked read;
+- restart followed by EOF;
+- restart followed by active-stream transport failure;
+- client cancellation;
+- slow-consumer backpressure with exact StreamBackpressure assertion.
+
+P3 conclusion
+=============
+
+P3 is complete:
+- systemd parity test count increased from 8 to 11;
+- all 11 targeted systemd parity tests passed;
+- the three Day 4C RED lifecycle tests are GREEN after P2;
+- the slow-consumer test now proves StreamBackpressure exactly;
+- one non-fatal ResourceWarning was emitted by the Python stdlib/socket cleanup
+  path during the run, but the test process exited 0 and unittest result is OK;
+- no public protocol change was made during P3;
+- no production code was modified during P3;
+- no secret values were copied into this evidence file.
