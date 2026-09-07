@@ -993,6 +993,7 @@ class SystemdTransientWorkerHost(WorkerHost):
             # generation's Bearer credential (never logged, never in argv).
             headers["Authorization"] = "Bearer " + self._secret
         conn = None
+        resp = None
         try:
             conn = http.client.HTTPConnection(
                 "127.0.0.1", self._port, timeout=self._timeout
@@ -1075,11 +1076,7 @@ class SystemdTransientWorkerHost(WorkerHost):
             return "idle" if seen else "first_chunk"
 
         def _raise_stream_timeout(reason: str) -> None:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+            _close_stream_connection()
             self._audit_event(
                 "INFERENCE_TIMEOUT",
                 detail=f"stream {reason} timeout",
@@ -1095,12 +1092,20 @@ class SystemdTransientWorkerHost(WorkerHost):
                 or self._secret != stream_secret
             )
 
-        def _raise_stream_restarted() -> None:
+        def _close_stream_connection() -> None:
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
             if conn is not None:
                 try:
                     conn.close()
                 except Exception:
                     pass
+
+        def _raise_stream_restarted() -> None:
+            _close_stream_connection()
             raise StreamRestarted(
                 f"worker generation recycled during stream: {self._app_id}"
             )
@@ -1173,11 +1178,7 @@ class SystemdTransientWorkerHost(WorkerHost):
                         bp_timeout is not None
                         and time.monotonic() - before_yield > bp_timeout
                     ):
-                        if conn is not None:
-                            try:
-                                conn.close()
-                            except Exception:
-                                pass
+                        _close_stream_connection()
                         raise StreamBackpressure(
                             "stream backpressure: consumer stalled beyond "
                             f"stream_backpressure_timeout: {self._app_id}"
@@ -1194,16 +1195,12 @@ class SystemdTransientWorkerHost(WorkerHost):
             if not terminal:
                 _raise_if_stream_stale()
                 raise RuntimeError("worker stream ended before terminal frame")
-            conn.close()
+            _close_stream_connection()
         except socket.timeout:
             _raise_if_stream_stale()
             _raise_stream_timeout(_stream_timeout_reason())
         except GeneratorExit:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+            _close_stream_connection()
             self._audit_event("STREAM_CANCELLED", detail="client disconnected")
             self._recycle_after_timeout()
             raise
@@ -1211,11 +1208,7 @@ class SystemdTransientWorkerHost(WorkerHost):
             _raise_if_stream_stale()
             raise WorkerNotReady(f"worker unreachable: {self._app_id}") from exc
         finally:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+            _close_stream_connection()
 
     # ---- timeout recycle (Day 1B, 2026-08-26) --------------------------
 

@@ -387,9 +387,12 @@ class SystemdStreamingParityTests(unittest.TestCase):
 
         self.assertEqual(next(stream), {"label": "first"})
         self.assertTrue(server.first_chunk_sent.wait(timeout=1.0))
-        host.restart("app-a")
-        with self.assertRaises(StreamRestarted):
-            next(stream)
+        try:
+            host.restart("app-a")
+            with self.assertRaises(StreamRestarted):
+                next(stream)
+        finally:
+            stream.close()
 
     def test_systemd_concurrent_restart_during_blocked_read_raises_stream_restarted(self) -> None:
         host, _fake, server = self._start_host(
@@ -402,16 +405,23 @@ class SystemdStreamingParityTests(unittest.TestCase):
             },
         )
         stream = host.stream({"text": "hello"}, "r-blocked-restart")
-        self.assertEqual(next(stream), {"label": "first"})
+        reader = None
+        try:
+            self.assertEqual(next(stream), {"label": "first"})
 
-        reader, read_entered, result = self._start_next_reader_after_read_enters(stream)
-        self.assertTrue(read_entered.wait(timeout=1.0))
-        host.restart("app-a")
-        reader.join(timeout=2.0)
-        server.continue_after_restart.set()
+            reader, read_entered, result = self._start_next_reader_after_read_enters(stream)
+            self.assertTrue(read_entered.wait(timeout=1.0))
+            host.restart("app-a")
+            server.continue_after_restart.set()
+            reader.join(timeout=2.0)
 
-        self.assertFalse(reader.is_alive())
-        self.assertIsInstance(result.get("exception"), StreamRestarted)
+            self.assertFalse(reader.is_alive())
+            self.assertIsInstance(result.get("exception"), StreamRestarted)
+        finally:
+            server.continue_after_restart.set()
+            if reader is not None:
+                reader.join(timeout=2.0)
+            stream.close()
 
     def test_systemd_restart_followed_by_eof_raises_stream_restarted(self) -> None:
         host, _fake, server = self._start_host(
@@ -424,16 +434,22 @@ class SystemdStreamingParityTests(unittest.TestCase):
             },
         )
         stream = host.stream({"text": "hello"}, "r-restart-eof")
+        reader = None
+        try:
+            self.assertEqual(next(stream), {"label": "first"})
+            reader, read_entered, result = self._start_next_reader_after_read_enters(stream)
+            self.assertTrue(read_entered.wait(timeout=1.0))
+            host.restart("app-a")
+            server.continue_after_restart.set()
+            reader.join(timeout=2.0)
 
-        self.assertEqual(next(stream), {"label": "first"})
-        reader, read_entered, result = self._start_next_reader_after_read_enters(stream)
-        self.assertTrue(read_entered.wait(timeout=1.0))
-        host.restart("app-a")
-        server.continue_after_restart.set()
-        reader.join(timeout=2.0)
-
-        self.assertFalse(reader.is_alive())
-        self.assertIsInstance(result.get("exception"), StreamRestarted)
+            self.assertFalse(reader.is_alive())
+            self.assertIsInstance(result.get("exception"), StreamRestarted)
+        finally:
+            server.continue_after_restart.set()
+            if reader is not None:
+                reader.join(timeout=2.0)
+            stream.close()
 
     def test_systemd_restart_followed_by_transport_failure_raises_stream_restarted(self) -> None:
         host, _fake, server = self._start_host(
@@ -446,16 +462,22 @@ class SystemdStreamingParityTests(unittest.TestCase):
             },
         )
         stream = host.stream({"text": "hello"}, "r-restart-transport")
+        reader = None
+        try:
+            self.assertEqual(next(stream), {"label": "first"})
+            reader, read_entered, result = self._start_next_reader_after_read_enters(stream)
+            self.assertTrue(read_entered.wait(timeout=1.0))
+            host.restart("app-a")
+            server.continue_after_restart.set()
+            reader.join(timeout=2.0)
 
-        self.assertEqual(next(stream), {"label": "first"})
-        reader, read_entered, result = self._start_next_reader_after_read_enters(stream)
-        self.assertTrue(read_entered.wait(timeout=1.0))
-        host.restart("app-a")
-        server.continue_after_restart.set()
-        reader.join(timeout=2.0)
-
-        self.assertFalse(reader.is_alive())
-        self.assertIsInstance(result.get("exception"), StreamRestarted)
+            self.assertFalse(reader.is_alive())
+            self.assertIsInstance(result.get("exception"), StreamRestarted)
+        finally:
+            server.continue_after_restart.set()
+            if reader is not None:
+                reader.join(timeout=2.0)
+            stream.close()
 
     def test_systemd_client_cancellation_does_not_leave_worker_busy(self) -> None:
         host, fake, _server = self._start_host(

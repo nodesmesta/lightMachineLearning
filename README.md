@@ -1,348 +1,547 @@
-# 04092026
+# 07092026
 
 ## Summary
 
-This report covers **PHASE 2 / DAY 4B - K5 SYSTEMD PRODUCTION-PATH REVISION**
-for SYDECO LightML V2. The work is derived from the review document
-`Jamaludin REPORTS 3 SEPTEMBER REVIEWED.docx`, which did not accept Day 4 K5
-as closed.
+This report covers **PHASE 2 / DAY 4C - FINAL K5 LIFECYCLE CLOSURE** for
+SYDECO LightML V2. It is a direct continuation of the 04-09 K5 systemd
+production-path revision review. That review recognized that Day 4B had already
+closed almost all of the previous K5 parity gaps: explicit internal terminal
+framing, first/idle/total stream deadlines, generation tracking, cancellation,
+batch-stream rejection, unsupported-stream handling, and systemd backpressure.
+The reviewer also independently confirmed that the K5 streaming tests and full
+regression passed.
 
-Reviewer verdict for the 03-09 submission:
+Reviewer verdict for the 04-09 submission:
 
-> I do not yet accept PHASE 2 / DAY 4 - K5 as closed.
+> Very strong revision, but I do not yet accept K5 as completely closed.
 
-Reviewer score: **84/100 - technically strong work, but REVISION REQUIRED
-before K5 acceptance.**
+The remaining blocker was not a broad design failure. It was one production
+lifecycle race in `SystemdTransientWorkerHost.stream()`:
 
-The blocker was specific: K5 behavior was proven mostly on
-`InProcessWorkerHost`, while the production-path `SystemdTransientWorkerHost`
-did not yet have equivalent timeout, terminal-frame, lifecycle, cancellation,
-and backpressure proof.
+**When an active systemd stream is already blocked inside `resp.readline()` and
+the worker is restarted concurrently, the old stream can return `StreamTimeout`
+or another transport/protocol error instead of `StreamRestarted`.**
 
-Status after this revision:
+The Day 4C work therefore does three things:
+- reproduces that lifecycle race with deterministic RED tests before changing
+  production code;
+- applies the smallest production-path fix so stale worker generation takes
+  precedence over timeout, EOF, successful old-generation reads, and transport
+  failures;
+- proves the result through systemd parity tests, complete K5 streaming tests,
+  full regression, isolated-copy regression, compile checks, and final package
+  integrity checks.
 
-**PHASE 2 / DAY 4 - K5 STREAMING: REVISION SUBMITTED / AWAITING REVIEW.**
+P6 is not reported as a separate technical evidence section because P6 is the
+documentation/reporting process itself. The documentation output is this
+workspace README and the generated daily report DOCX. The technical evidence is
+recorded in P0-P5, while P7 records final package/report/hash discipline.
+
+Status:
+
+**SYDECO LIGHTML UNIVERSAL RUNTIME V2 - DEVELOPMENT / PROOF OF CONCEPT - K5 DAY
+4C SUBMITTED / AWAITING REVIEW.**
 
 ## Scope
 
-This revision only closes K5 production-path parity. It does not start J4B,
-CRA integration, F4/F6 schema migration/update handling, production signing
-key infrastructure, permanent installer/unit acceptance, or LightML 1.0.1
+This Day 4C work is limited to final K5 lifecycle closure:
+- add deterministic RED tests for concurrent restart while systemd stream I/O
+  is blocked;
+- give stale worker generation precedence over timeout, EOF, and transport
+  failure interpretations;
+- verify systemd parity, the full K5 streaming surface, full regression, and
+  isolated-copy regression;
+- prepare workspace evidence and this report.
+
+This work does not start J4B Dependency Artifact Authenticity, CRA integration,
+F4/F6 schema migration/update handling, production signing, installer
+acceptance, WorkerManager redesign, a new streaming protocol, or LightML 1.0.1
 changes.
 
 ## Commit Log
 
 | Commit | Purpose |
-|--------|---------|
-| `5d6e8d5` | Close K5 systemd streaming parity: tests plus production-path fixes for P1-P5 |
-| `1b90cf3` | Document K5 revision evidence and replace stale README with the 04-09 report |
+|---|---|
+| `2bb6e29` | Add Day 4C lifecycle RED tests |
+| `4af8808` | Fix systemd stream restart precedence |
+| `56aee2e` | Record systemd parity verification |
+| `04c3938` | Record full streaming verification |
+| `753a732` | Record regression verification |
+| `c39ddef` | Record package procedure |
 
-Final HEAD, commit count, clean-tree state, package name, and package hash are
-recorded in the P8 evidence and package hash section.
-
-## P0 - Baseline And Reviewer Findings
-
-Baseline repository state before code changes:
+Current repository state after P7 package-procedure commit:
 
 ```text
-HEAD: b21eb0f
-commit count: 17
+HEAD: c39ddef
+commit count: 27
 git status: clean
 ```
 
-Existing streaming tests were run from an isolated copy:
+## P0 - Day 4C Baseline
+
+P0 was read-only. It confirmed the current baseline and the exact reviewer
+finding before any Day 4C code changes.
+
+Baseline state:
 
 ```text
-python3 -m unittest discover -s tests -p 'test_streaming_systemd_auth.py' -v
-Ran 2 tests in 1.014s
-OK
+git -C /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV rev-parse --short HEAD
+9c0d95d
 
-python3 -m unittest discover -s tests -p 'test_streaming*.py' -v
-Ran 25 tests in 141.727s
-OK
+git -C /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV rev-list --count HEAD
+21
+
+git -C /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV status --short
+<no output; working tree clean>
 ```
 
-Baseline findings confirmed:
+Baseline test definitions:
 
-| Finding | Baseline status |
-|---------|-----------------|
-| Systemd stream used ordinary `inference_timeout` as HTTP timeout | confirmed |
-| `stream_first_chunk_timeout`, `stream_idle_timeout`, `stream_total_timeout` were not independently enforced in systemd path | confirmed |
-| EOF meant normal completion without explicit terminal frame | confirmed |
-| Worker runtime encoded stream errors as normal `data` | confirmed |
-| Batch streaming silently used `items[0]` | confirmed |
-| Existing systemd stream tests covered auth only | confirmed |
+```text
+streaming tests: 35
+total tests: 134
+```
 
-Evidence: `data/evidence_p0_systemd_k5_baseline.txt`.
+Confirmed baseline findings:
+- `SystemdTransientWorkerHost.stream()` already captured stream identity using
+  `_unit`, `_launch_count`, and `_secret`;
+- `_stream_stale()` already existed, but stale-generation precedence was not
+  checked in all reviewer-required locations;
+- `resp.readline()` returned data without an immediate stale check before EOF
+  or frame interpretation;
+- `socket.timeout` could become `StreamTimeout` before stale generation won;
+- EOF before terminal frame could become protocol failure before stale
+  generation won;
+- transport failure could become `WorkerNotReady` before stale generation won;
+- the slow-consumer systemd test used generic `Exception`, not exact
+  `StreamBackpressure`.
 
-## P1 - RED Systemd Parity Tests
+Evidence: `data/evidence_p0_day4c_lifecycle_baseline.txt`.
 
-Added `tests/test_streaming_systemd_parity.py` with focused RED coverage for
-the production-path host class.
+## P1 - RED Lifecycle Tests
 
-RED baseline:
+P1 added deterministic RED coverage before production code changes. The tests
+exercise `SystemdTransientWorkerHost`, with the systemd manager faked but the
+Core-side production host, loopback HTTP stream, and credential-forwarding path
+using the real code under test.
+
+New tests:
+- restart while blocked in the read path;
+- restart followed by EOF;
+- restart followed by active-stream transport failure.
+
+Tightened existing test:
+- slow-consumer systemd behavior now expects `StreamBackpressure` exactly.
+
+RED evidence:
 
 ```text
 python3 -m unittest discover -s tests -p 'test_streaming_systemd_parity.py' -v
-Ran 8 tests in 5.055s
-FAILED (failures=7, errors=1)
+
+test_systemd_concurrent_restart_during_blocked_read_raises_stream_restarted ... FAIL
+test_systemd_restart_followed_by_eof_raises_stream_restarted ... FAIL
+test_systemd_restart_followed_by_transport_failure_raises_stream_restarted ... FAIL
+test_systemd_slow_consumer_has_bounded_behavior ... ok
+
+Ran 11 tests in 4.134s
+FAILED (failures=3)
 ```
 
-The RED tests cover:
+Failure meanings:
+- blocked read after concurrent restart reported `StreamTimeout`, not
+  `StreamRestarted`;
+- EOF after restart reported `RuntimeError`, not `StreamRestarted`;
+- transport failure after restart reported `RuntimeError`, not
+  `StreamRestarted`;
+- tightened backpressure behavior already raised `StreamBackpressure`.
 
-| Test area | Production-path requirement |
-|-----------|-----------------------------|
-| first chunk timeout | no first chunk beyond bound -> `StreamTimeout("first_chunk")` |
-| idle timeout | stall between chunks -> `StreamTimeout("idle")` |
-| total timeout | active stream cannot exceed monotonic total deadline |
-| adapter error frame | internal error is not yielded as chunk data |
-| abnormal EOF | EOF before terminal frame fails closed |
-| restart during stream | old stream raises `StreamRestarted` |
-| client cancellation | cancellation triggers bounded scoped lifecycle action |
-| slow consumer | slow consumer does not produce silent unbounded behavior |
+Evidence: `data/evidence_p1_day4c_concurrent_restart_red_tests.txt`.
 
-Evidence: `data/evidence_p1_systemd_k5_red_tests.txt`.
+## P2 - Lifecycle Precedence Fix
 
-## P2 - Private Stream Terminal Protocol
+P2 implemented the minimal production-path fix in
+`SystemdTransientWorkerHost.stream()`.
 
-Changed the private worker-to-Core `/stream` protocol from implicit
-`{"data": ...}` only to explicit internal frames:
+What changed:
+- added a local `_raise_if_stream_stale()` helper;
+- reused the existing stream identity snapshot: `_unit`, `_launch_count`,
+  `_secret`;
+- checked stale generation before loop iteration processing;
+- checked stale generation immediately after `line = resp.readline()` returns;
+- checked stale generation before accepting chunk and completed frames;
+- checked stale generation before abnormal EOF becomes protocol failure;
+- checked stale generation before `socket.timeout` becomes `StreamTimeout`;
+- checked stale generation before transport failure becomes `WorkerNotReady`.
 
-```json
-{"type": "chunk", "data": "<adapter chunk>"}
-{"type": "completed"}
-{"type": "error", "error": {"code": "500", "message": "internal error"}}
-```
+Behavior intentionally preserved when the stream is not stale:
+- first-chunk, idle, and total timeout still raise `StreamTimeout`;
+- abnormal EOF still fails closed;
+- transport failure still maps to `WorkerNotReady`;
+- adapter error and malformed protocol behavior remain unchanged;
+- public server mapping remains unchanged.
 
-Systemd Core-side parsing now accepts only `chunk`, `completed`, and `error`.
-Malformed frames fail closed. EOF before `completed` or `error` fails closed.
-Adapter exception text is not forwarded.
-
-Targeted verification:
+Targeted GREEN evidence:
 
 ```text
-python3 -m unittest tests.test_streaming_systemd_parity.SystemdStreamingParityTests.test_systemd_adapter_error_frame_is_not_returned_as_chunk_data tests.test_streaming_systemd_parity.SystemdStreamingParityTests.test_systemd_abnormal_eof_before_terminal_frame_fails_closed -v
-Ran 2 tests in 1.015s
-OK
-
-python3 -m unittest discover -s tests -p 'test_streaming_systemd_auth.py' -v
-Ran 2 tests in 1.012s
-OK
-```
-
-Evidence: `data/evidence_p2_systemd_terminal_protocol.txt`.
-
-## P3 - Systemd Streaming Deadlines
-
-`SystemdTransientWorkerHost.stream()` now enforces three independent K5 bounds
-from `resource_limits`:
-
-| Bound | Enforcement |
-|-------|-------------|
-| `stream_first_chunk_timeout` | max wait for first internal stream frame |
-| `stream_idle_timeout` | max gap between chunks |
-| `stream_total_timeout` | monotonic absolute total stream deadline |
-
-Timeout handling closes the connection, audits `INFERENCE_TIMEOUT`, recycles
-only the affected worker, and raises `StreamTimeout(reason, ...)`.
-
-Targeted verification:
-
-```text
-python3 -m unittest tests.test_streaming_systemd_parity.SystemdStreamingParityTests.test_systemd_first_chunk_timeout_uses_stream_bound tests.test_streaming_systemd_parity.SystemdStreamingParityTests.test_systemd_idle_timeout_uses_stream_bound tests.test_streaming_systemd_parity.SystemdStreamingParityTests.test_systemd_total_timeout_uses_monotonic_absolute_deadline -v
-Ran 3 tests in 0.372s
-OK
-```
-
-Evidence: `data/evidence_p3_systemd_stream_timeouts.txt`.
-
-## P4 - Systemd Lifecycle And Cancellation
-
-`SystemdTransientWorkerHost.stream()` now snapshots the active stream identity:
-
-```text
-_unit
-_launch_count
-_secret
-```
-
-If the worker is stopped, restarted, relaunched, or credential-rotated while a
-stream is active, the old stream is invalidated and raises `StreamRestarted`
-instead of completing normally.
-
-Client/generator cancellation closes the connection, audits `STREAM_CANCELLED`,
-and triggers scoped lifecycle action through the existing recycle path.
-
-Targeted verification:
-
-```text
-python3 -m unittest tests.test_streaming_systemd_parity.SystemdStreamingParityTests.test_systemd_restart_during_active_stream_raises_stream_restarted tests.test_streaming_systemd_parity.SystemdStreamingParityTests.test_systemd_client_cancellation_does_not_leave_worker_busy -v
-Ran 2 tests in 1.022s
-OK
-```
-
-Evidence: `data/evidence_p4_systemd_lifecycle_cancellation.txt`.
-
-## P5 - Protocol Correctness And Backpressure
-
-Public protocol corrections:
-
-| Case | Result |
-|------|--------|
-| streaming batch request with `{"inputs": [...]}` | HTTP 400 JSON, rejected before worker |
-| app without `stream()` | NDJSON `worker_error`, code 400, message `streaming not supported` |
-| systemd slow consumer | bounded by `stream_backpressure_timeout`, raises `StreamBackpressure` |
-
-Targeted verification:
-
-```text
-python3 -m unittest tests.test_streaming_contract.StreamingContractTests.test_streaming_batch_request_is_rejected_before_worker tests.test_streaming_contract.StreamingContractTests.test_streaming_unsupported_app_returns_controlled_error -v
-Ran 2 tests in 10.106s
-OK
-
 python3 -m unittest discover -s tests -p 'test_streaming_systemd_parity.py' -v
-Ran 8 tests in 2.909s
-OK
 
+Ran 11 tests in 4.431s
+OK
+```
+
+Evidence: `data/evidence_p2_day4c_lifecycle_precedence_green.txt`.
+
+## P3 - Systemd Parity Verification
+
+P3 re-ran the targeted systemd parity surface after P2.
+
+Systemd parity count:
+
+```text
+11
+```
+
+Backpressure assertion check:
+
+```text
+499:        with self.assertRaises(StreamBackpressure):
+```
+
+Targeted result:
+
+```text
+python3 -m unittest discover -s tests -p 'test_streaming_systemd_parity.py' -v
+
+Ran 11 tests in 4.437s
+OK
+```
+
+Coverage confirmed:
+- first chunk timeout;
+- idle timeout;
+- total timeout;
+- adapter error frame handling;
+- abnormal EOF fail-closed behavior;
+- restart during active stream;
+- deterministic concurrent restart during blocked read;
+- restart followed by EOF;
+- restart followed by active-stream transport failure;
+- client cancellation;
+- slow-consumer backpressure with exact `StreamBackpressure` assertion.
+
+One non-fatal `ResourceWarning` was observed during one P3 run from the
+stdlib/socket cleanup path. A supporting analysis note was written in
+`data/report.md`. The warning did not fail the suite and did not alter the P3
+result.
+
+Evidence: `data/evidence_p3_day4c_systemd_parity_targeted.txt`.
+
+## P4 - Complete K5 Streaming Verification
+
+P4 ran the complete K5 streaming surface.
+
+Streaming test count:
+
+```text
+38
+```
+
+Streaming split:
+
+| Test Module | Count |
+|---|---:|
+| `test_streaming_isolation.py` | 5 |
+| `test_streaming_timeout.py` | 3 |
+| `test_streaming_contract.py` | 8 |
+| `test_streaming_systemd_parity.py` | 11 |
+| `test_streaming_systemd_auth.py` | 2 |
+| `test_streaming_cancellation.py` | 2 |
+| `test_streaming_security.py` | 5 |
+| `test_streaming_backpressure.py` | 2 |
+
+Complete K5 streaming result:
+
+```text
 python3 -m unittest discover -s tests -p 'test_streaming*.py' -v
-Ran 35 tests in 144.783s
+
+Ran 38 tests in 148.226s
 OK
 ```
 
-Evidence: `data/evidence_p5_stream_protocol_correctness.txt`.
+P4 confirmed:
+- no previous streaming test disappeared;
+- 3 Day 4C lifecycle tests were added;
+- systemd authentication and credential rotation passed;
+- systemd lifecycle race tests passed;
+- timeout, cancellation, backpressure, lifecycle isolation, protocol framing,
+  malformed input, oversize input, unsupported streaming, and batch rejection
+  tests passed.
 
-## P6 - Targeted K5 Parity Verification
+Two logged tracebacks appeared in expected negative/security test paths. Both
+tests completed with `ok`, and the final suite result was `OK`.
 
-Targeted verification was run from `/tmp/sydeco_k5_p6_verify`.
+Evidence: `data/evidence_p4_day4c_streaming_full_targeted.txt`.
+
+## P5 - Full Regression And Isolated Copy
+
+P5 ran full regression, isolated-copy regression, repo-wide compile, and final
+hygiene checks.
+
+Current committed state before P5 evidence commit:
 
 ```text
-py_compile targeted: PASS
-systemd parity tests: 8/8 PASS
-systemd auth tests: 2/2 PASS
-public streaming contract tests: 8/8 PASS
-full targeted K5 streaming suite: 35/35 PASS
+HEAD: 04c3938
+commit count: 25
+git status: clean
 ```
 
-Coverage split:
+Test counts:
 
-| Group | Count |
-|-------|-------|
-| previous K5 streaming tests from 03-09 | 25 |
-| new `SystemdTransientWorkerHost` parity tests | 8 |
-| new public protocol correctness tests | 2 |
-| total targeted K5 streaming tests | 35 |
+```text
+total tests: 137
+streaming tests: 38
+```
 
-Evidence scan found no concrete token material.
-
-Evidence: `data/evidence_p6_k5_targeted_parity.txt`.
-
-## P7 - Full Regression And Fresh Extraction
-
-Full regression from isolated repo copy:
+Full regression in the main repository:
 
 ```text
 python3 -m unittest discover -s tests -v
-Ran 134 tests in 443.808s
+
+Ran 137 tests in 448.448s
 OK
 ```
 
-Fresh extraction regression:
+Isolated-copy regression:
 
 ```text
+copy path: /tmp/sydeco_day4c_p5_verify
+
 python3 -m unittest discover -s tests -v
-Ran 134 tests in 443.150s
+
+Ran 137 tests in 451.480s
 OK
 ```
 
-Repo-wide compile from fresh extraction:
+`py_compile` verification:
 
 ```text
-find . -name '*.py' -print0 | xargs -0 python3 -m py_compile
+find /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV -name '*.py' -print0 | xargs -0 python3 -m py_compile
+<no output; command exited 0>
+
+find /tmp/sydeco_day4c_p5_verify -name '*.py' -print0 | xargs -0 python3 -m py_compile
 <no output; command exited 0>
 ```
 
-Hygiene:
+Generated cache cleanup:
 
 ```text
-find /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV -name '__pycache__' -o -name '*.pyc' -o -name '*.pyo' | head -100
-<no output>
+main repo generated __pycache__/.pyc/.pyo entries before cleanup: 52
+isolated copy generated __pycache__/.pyc/.pyo entries before cleanup: 52
+
+main repo generated __pycache__/.pyc/.pyo entries after cleanup: 0
+isolated copy generated __pycache__/.pyc/.pyo entries after cleanup: 0
 ```
 
 Scope checks:
 
-| Check | Result |
-|-------|--------|
-| full regression | 134/134 PASS |
-| fresh extraction regression | 134/134 PASS |
-| test count higher than 124 baseline | PASS |
-| repo-wide `py_compile` | PASS |
-| `__pycache__` / `.pyc` / `.pyo` in main repo | none |
-| production signing key artifact | none |
-| LightML 1.0.1 | untouched |
-| CRA | untouched |
+```text
+production signing key / prod key / CRA search in dev repo:
+<no output>
+```
 
-Evidence: `data/evidence_p7_regression_fresh_extraction.txt`.
+P5 confirmed:
+- full regression passed `137/137`;
+- isolated-copy regression passed `137/137`;
+- repo-wide `py_compile` passed;
+- isolated-copy `py_compile` passed;
+- generated Python cache artifacts were removed after explicit approval;
+- no production signing key or CRA artifact was found in the dev repo;
+- Day 2 worker authentication remains intact;
+- Day 3B J1/J2 dependency isolation remains intact;
+- timeout recovery remains intact;
+- application isolation remains intact;
+- credential lifecycle remains intact.
 
-## P8 - Report And Package Discipline
+Evidence: `data/evidence_p5_day4c_regression_fresh_extraction.txt`.
 
-P8 actions:
+## P7 - Package, Report, And Hash
 
-| Artifact | Status |
-|----------|--------|
-| final English README | this file |
-| daily report DOCX | generated from this README via pandoc |
-| final ZIP | generated after README/report commit |
-| `.zip.sha256` sidecar | generated from the exact final ZIP |
-| final package evidence | recorded in `data/evidence_p8_package_report_hash.txt` |
+P7 corrected the package/report/hash discipline called out by the reviewer.
 
-The sidecar name must be exactly:
+Canonical package evidence:
 
 ```text
-SYDECO_LIGHTML_V2_DEV_2026-09-04.zip.sha256
+data/evidence_p7_day4c_package_report_hash.txt
 ```
+
+That file is included inside the source ZIP and intentionally does not contain
+the final ZIP hash, because embedding the final ZIP hash inside the ZIP would
+create a circular hashing problem.
+
+Final source state used for packaging:
+
+```text
+HEAD: c39ddef
+commit count: 27
+git status: clean
+generated __pycache__/.pyc/.pyo entries: 0
+```
+
+Report artifact:
+
+```text
+/home/sydeco/Dev/Report/week-6/JAMALUDIN_DailyReport_07-09-2026.docx
+```
+
+Package artifacts:
+
+```text
+/home/sydeco/Dev/Task/week-6/07-09-2026/data/SYDECO_LIGHTML_V2_DEV_2026-09-07.zip
+/home/sydeco/Dev/Task/week-6/07-09-2026/data/SYDECO_LIGHTML_V2_DEV_2026-09-07.zip.sha256
+```
+
+ZIP integrity:
+
+```text
+unzip -t /home/sydeco/Dev/Task/week-6/07-09-2026/data/SYDECO_LIGHTML_V2_DEV_2026-09-07.zip
+
+No errors detected in compressed data of /home/sydeco/Dev/Task/week-6/07-09-2026/data/SYDECO_LIGHTML_V2_DEV_2026-09-07.zip.
+```
+
+SHA-256 sidecar:
+
+```text
+5dbb5f756112b39b1c13bcf939b01725ac74cbb65d6b4ff03bd8ff1f243a88d7  SYDECO_LIGHTML_V2_DEV_2026-09-07.zip
+```
+
+SHA-256 verification:
+
+```text
+sha256sum -c SYDECO_LIGHTML_V2_DEV_2026-09-07.zip.sha256
+
+SYDECO_LIGHTML_V2_DEV_2026-09-07.zip: OK
+```
+
+Package content check:
+
+```text
+SYDECO_LIGHTML_V2_DEV/data/evidence_p7_day4c_package_report_hash.txt
+SYDECO_LIGHTML_V2_DEV/sydeco_lightml_core/worker.py
+SYDECO_LIGHTML_V2_DEV/tests/test_streaming_systemd_parity.py
+```
+
+No `.zip.sha256`, `__pycache__`, `.pyc`, or `.pyo` entry appeared in the package
+content check.
+
+Evidence: `data/evidence_p7_day4c_package_report_hash.txt`.
+
+## P8 - Final Handoff Summary
+
+Final repository state:
+
+```text
+HEAD: c39ddef
+commit count: 27
+git status: clean
+```
+
+Final verification summary:
+
+| Check | Result |
+|---|---:|
+| systemd parity tests | 11/11 PASS |
+| complete K5 streaming tests | 38/38 PASS |
+| full regression in main repo | 137/137 PASS |
+| isolated-copy regression | 137/137 PASS |
+| repo-wide `py_compile` | PASS |
+| isolated-copy `py_compile` | PASS |
+| generated cache artifacts | 0 |
+| final ZIP integrity | PASS |
+| final `.zip.sha256` verification | PASS |
+
+Final artifacts:
+
+| Artifact | Status |
+|---|---|
+| daily report DOCX | generated |
+| source ZIP | generated |
+| external SHA-256 sidecar | verified |
+| canonical package evidence | included in ZIP |
+
+Final artifact paths:
+- daily report DOCX:
+  `/home/sydeco/Dev/Report/week-6/JAMALUDIN_DailyReport_07-09-2026.docx`
+- source ZIP:
+  `data/SYDECO_LIGHTML_V2_DEV_2026-09-07.zip`
+- external SHA-256 sidecar:
+  `data/SYDECO_LIGHTML_V2_DEV_2026-09-07.zip.sha256`
+- canonical package evidence:
+  `data/evidence_p7_day4c_package_report_hash.txt`
+
+Final SHA-256:
+
+```text
+5dbb5f756112b39b1c13bcf939b01725ac74cbb65d6b4ff03bd8ff1f243a88d7  SYDECO_LIGHTML_V2_DEV_2026-09-07.zip
+```
+
+Explicit non-scope confirmation:
+- J4B Dependency Artifact Authenticity was not started;
+- CRA integration was not started;
+- F4/F6 schema migration/update handling was not started;
+- no production signing key was created or used;
+- permanent installer/unit acceptance was not started;
+- LightML 1.0.1 was not modified;
+- WorkerManager was not redesigned;
+- no new streaming protocol was introduced.
 
 ## Evidence Table
 
-| File | Content |
-|------|---------|
-| `data/evidence_p0_systemd_k5_baseline.txt` | P0 baseline, reviewer findings, coverage matrix |
-| `data/evidence_p1_systemd_k5_red_tests.txt` | P1 RED systemd parity tests |
-| `data/evidence_p2_systemd_terminal_protocol.txt` | P2 private terminal protocol fix |
-| `data/evidence_p3_systemd_stream_timeouts.txt` | P3 systemd first/idle/total timeout proof |
-| `data/evidence_p4_systemd_lifecycle_cancellation.txt` | P4 restart and cancellation parity proof |
-| `data/evidence_p5_stream_protocol_correctness.txt` | P5 batch/unsupported/backpressure proof |
-| `data/evidence_p6_k5_targeted_parity.txt` | P6 targeted K5 parity/security verification |
-| `data/evidence_p7_regression_fresh_extraction.txt` | P7 full regression and fresh extraction |
-| `data/evidence_p8_package_report_hash.txt` | P8 final report/package/hash proof |
+| Phase | Evidence | Content |
+|---|---|---|
+| P0 | `evidence_p0_day4c_lifecycle_baseline.txt` | Baseline and reviewer finding |
+| P1 | `evidence_p1_day4c_concurrent_restart_red_tests.txt` | RED lifecycle tests |
+| P2 | `evidence_p2_day4c_lifecycle_precedence_green.txt` | Lifecycle precedence GREEN |
+| P3 | `evidence_p3_day4c_systemd_parity_targeted.txt` | Systemd parity verification |
+| P4 | `evidence_p4_day4c_streaming_full_targeted.txt` | Complete K5 streaming verification |
+| P5 | `evidence_p5_day4c_regression_fresh_extraction.txt` | Full and isolated-copy regression |
+| P7 | `evidence_p7_day4c_package_report_hash.txt` | Package/report/hash procedure |
+| Note | `report.md` | Non-fatal ResourceWarning observation |
 
 ## What Remains
 
-K5 is submitted for review after this production-path revision. J4B Dependency
-Artifact Authenticity should start only after reviewer acceptance of this K5
-revision.
+K5 Day 4C is packaged and ready for reviewer submission. J4B Dependency
+Artifact Authenticity must start only after reviewer acceptance of this K5 Day
+4C package.
 
 ## Constraints Honored
 
-- K5 revision only; no J4B implementation.
+- K5 Day 4C lifecycle closure only.
+- No J4B implementation.
 - No CRA integration.
 - No F4/F6 schema migration/update handling.
 - No production signing key created or used.
 - No permanent installer/unit acceptance work.
 - No LightML 1.0.1 modification.
+- No WorkerManager redesign.
 - No new streaming protocol such as WebSocket or SSE.
-- No external/cloud dependency introduced; wording remains "needs no Internet
-  beyond OS dependencies".
+- No external/cloud dependency introduced; the deliverable needs no Internet
+  beyond OS dependencies.
 - Evidence files are secret-free.
-- Final package uses `.zip` plus correctly named `.zip.sha256` sidecar.
+- Final package sidecar is external and uses `.zip.sha256`.
 
 ## Conclusion
 
-The reviewer-blocking K5 production-path parity gaps have been addressed.
-`SystemdTransientWorkerHost` now has explicit private stream terminal frames,
-independent first/idle/total stream deadlines, restart invalidation, bounded
-cancellation behavior, and slow-consumer backpressure handling. Public protocol
-gaps for streaming batch and unsupported streaming are closed. Targeted K5
-tests pass 35/35, and full regression plus fresh extraction pass 134/134.
+Day 4C closes the remaining K5 lifecycle race identified in the 04-09 review.
+The systemd production stream now gives stale worker generation precedence over
+timeout, EOF, and transport-failure interpretations, including after a blocking
+read succeeds but before any old-generation frame is accepted.
+
+The required RED tests were added first and reproduced the reviewer issue.
+After the minimal fix, systemd parity passed `11/11`, complete K5 streaming
+passed `38/38`, full regression passed `137/137`, isolated-copy regression
+passed `137/137`, and repo-wide compile checks passed. The final source ZIP and
+external `.zip.sha256` sidecar were generated and verified from commit
+`c39ddef`.
 
 Status: **SYDECO LIGHTML UNIVERSAL RUNTIME V2 - DEVELOPMENT / PROOF OF CONCEPT
-- K5 REVISION SUBMITTED / AWAITING REVIEW.**
+- K5 DAY 4C SUBMITTED / AWAITING REVIEW.**
