@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import tempfile
 import threading
 import time
@@ -20,6 +21,7 @@ from typing import Any, Callable
 from sydeco_lightml_core.audit import JsonlAuditBackend
 from sydeco_lightml_core.health import ReadinessStore
 from sydeco_lightml_core.worker import (
+    StreamBackpressure,
     StreamRestarted,
     StreamTimeout,
     SystemdTransientWorkerHost,
@@ -57,6 +59,7 @@ class _ScriptedWorkerServer:
         self.post_started = threading.Event()
         self.first_chunk_sent = threading.Event()
         self.client_disconnected = threading.Event()
+        self.continue_after_restart = threading.Event()
         self._script = script
         self._lock = threading.Lock()
 
@@ -172,6 +175,31 @@ def _slow_stream(handler: BaseHTTPRequestHandler, _server: _ScriptedWorkerServer
     handler._write_frame({"type": "completed"})
 
 
+def _block_after_first_chunk(handler: BaseHTTPRequestHandler, server: _ScriptedWorkerServer) -> None:
+    handler._send_stream_headers()
+    handler._write_frame({"type": "chunk", "data": {"label": "first"}})
+    server.continue_after_restart.wait(timeout=2.0)
+
+
+def _eof_after_restart(handler: BaseHTTPRequestHandler, server: _ScriptedWorkerServer) -> None:
+    handler._send_stream_headers()
+    handler._write_frame({"type": "chunk", "data": {"label": "first"}})
+    server.continue_after_restart.wait(timeout=2.0)
+    handler.close_connection = True
+
+
+def _transport_failure_after_restart(handler: BaseHTTPRequestHandler, server: _ScriptedWorkerServer) -> None:
+    handler._send_stream_headers()
+    handler._write_frame({"type": "chunk", "data": {"label": "first"}})
+    server.continue_after_restart.wait(timeout=2.0)
+    try:
+        handler.connection.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    handler.connection.close()
+    handler.close_connection = True
+
+
 class SystemdStreamingParityTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.mkdtemp(prefix="sydeco-stream-systemd-parity-")
@@ -231,6 +259,37 @@ class SystemdStreamingParityTests(unittest.TestCase):
     @staticmethod
     def _restore_subprocess(mod, orig) -> None:
         mod.run = orig
+
+    def _start_next_reader_after_read_enters(self, stream):
+        import http.client
+
+        original_readline = http.client.HTTPResponse.readline
+        read_entered = threading.Event()
+        read_marked = False
+        read_lock = threading.Lock()
+
+        def wrapped_readline(response, *args, **kwargs):
+            nonlocal read_marked
+            with read_lock:
+                if not read_marked:
+                    read_marked = True
+                    read_entered.set()
+            return original_readline(response, *args, **kwargs)
+
+        http.client.HTTPResponse.readline = wrapped_readline
+        self.addCleanup(self._restore_readline, http.client, original_readline)
+
+        result: dict[str, Any] = {}
+
+        def read_next() -> None:
+            try:
+                result["value"] = next(stream)
+            except BaseException as exc:
+                result["exception"] = exc
+
+        reader = threading.Thread(target=read_next)
+        reader.start()
+        return reader, read_entered, result
 
     def test_systemd_first_chunk_timeout_uses_stream_bound(self) -> None:
         host, _fake, _server = self._start_host(
@@ -332,6 +391,72 @@ class SystemdStreamingParityTests(unittest.TestCase):
         with self.assertRaises(StreamRestarted):
             next(stream)
 
+    def test_systemd_concurrent_restart_during_blocked_read_raises_stream_restarted(self) -> None:
+        host, _fake, server = self._start_host(
+            _block_after_first_chunk,
+            limits={
+                "inference_timeout": 2.0,
+                "stream_first_chunk_timeout": 1.0,
+                "stream_idle_timeout": 0.2,
+                "stream_total_timeout": 2.0,
+            },
+        )
+        stream = host.stream({"text": "hello"}, "r-blocked-restart")
+        self.assertEqual(next(stream), {"label": "first"})
+
+        reader, read_entered, result = self._start_next_reader_after_read_enters(stream)
+        self.assertTrue(read_entered.wait(timeout=1.0))
+        host.restart("app-a")
+        reader.join(timeout=2.0)
+        server.continue_after_restart.set()
+
+        self.assertFalse(reader.is_alive())
+        self.assertIsInstance(result.get("exception"), StreamRestarted)
+
+    def test_systemd_restart_followed_by_eof_raises_stream_restarted(self) -> None:
+        host, _fake, server = self._start_host(
+            _eof_after_restart,
+            limits={
+                "inference_timeout": 2.0,
+                "stream_first_chunk_timeout": 1.0,
+                "stream_idle_timeout": 1.0,
+                "stream_total_timeout": 2.0,
+            },
+        )
+        stream = host.stream({"text": "hello"}, "r-restart-eof")
+
+        self.assertEqual(next(stream), {"label": "first"})
+        reader, read_entered, result = self._start_next_reader_after_read_enters(stream)
+        self.assertTrue(read_entered.wait(timeout=1.0))
+        host.restart("app-a")
+        server.continue_after_restart.set()
+        reader.join(timeout=2.0)
+
+        self.assertFalse(reader.is_alive())
+        self.assertIsInstance(result.get("exception"), StreamRestarted)
+
+    def test_systemd_restart_followed_by_transport_failure_raises_stream_restarted(self) -> None:
+        host, _fake, server = self._start_host(
+            _transport_failure_after_restart,
+            limits={
+                "inference_timeout": 2.0,
+                "stream_first_chunk_timeout": 1.0,
+                "stream_idle_timeout": 1.0,
+                "stream_total_timeout": 2.0,
+            },
+        )
+        stream = host.stream({"text": "hello"}, "r-restart-transport")
+
+        self.assertEqual(next(stream), {"label": "first"})
+        reader, read_entered, result = self._start_next_reader_after_read_enters(stream)
+        self.assertTrue(read_entered.wait(timeout=1.0))
+        host.restart("app-a")
+        server.continue_after_restart.set()
+        reader.join(timeout=2.0)
+
+        self.assertFalse(reader.is_alive())
+        self.assertIsInstance(result.get("exception"), StreamRestarted)
+
     def test_systemd_client_cancellation_does_not_leave_worker_busy(self) -> None:
         host, fake, _server = self._start_host(
             _slow_stream,
@@ -371,8 +496,12 @@ class SystemdStreamingParityTests(unittest.TestCase):
 
         self.assertEqual(next(stream), {"label": "0"})
         time.sleep(0.2)
-        with self.assertRaises(Exception):
+        with self.assertRaises(StreamBackpressure):
             next(stream)
+
+    @staticmethod
+    def _restore_readline(mod, orig) -> None:
+        mod.HTTPResponse.readline = orig
 
 
 if __name__ == "__main__":

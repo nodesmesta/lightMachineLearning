@@ -1,0 +1,103 @@
+PHASE 2 / DAY 4C - P1 CONCURRENT RESTART RED TESTS
+Date: 2026-09-07
+Scope: add deterministic RED systemd lifecycle tests before production fix
+
+Files changed for P1:
+- /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/tests/test_streaming_systemd_parity.py
+
+Purpose
+=======
+
+P1 adds RED coverage for the reviewer-approved Day 4C blocker:
+- stale generation must win over timeout while a systemd stream is blocked in
+  the read path;
+- stale generation must win over EOF after restart;
+- stale generation must win over active-stream transport failure after restart;
+- slow-consumer systemd behavior must assert StreamBackpressure exactly.
+
+The new blocked-read tests use deterministic instrumentation of
+http.client.HTTPResponse.readline plus threading.Event synchronization. The
+test restarts the worker only after the reader thread has entered the blocking
+read call.
+
+New/tightened tests
+===================
+
+New tests:
+- test_systemd_concurrent_restart_during_blocked_read_raises_stream_restarted
+- test_systemd_restart_followed_by_eof_raises_stream_restarted
+- test_systemd_restart_followed_by_transport_failure_raises_stream_restarted
+
+Tightened existing test:
+- test_systemd_slow_consumer_has_bounded_behavior now expects
+  StreamBackpressure explicitly instead of generic Exception.
+
+RED command
+===========
+
+Command:
+  python3 -m unittest discover -s tests -p 'test_streaming_systemd_parity.py' -v
+
+Output:
+  test_systemd_abnormal_eof_before_terminal_frame_fails_closed (test_streaming_systemd_parity.SystemdStreamingParityTests) ... ok
+  test_systemd_adapter_error_frame_is_not_returned_as_chunk_data (test_streaming_systemd_parity.SystemdStreamingParityTests) ... ok
+  test_systemd_client_cancellation_does_not_leave_worker_busy (test_streaming_systemd_parity.SystemdStreamingParityTests) ... ok
+  test_systemd_concurrent_restart_during_blocked_read_raises_stream_restarted (test_streaming_systemd_parity.SystemdStreamingParityTests) ... FAIL
+  test_systemd_first_chunk_timeout_uses_stream_bound (test_streaming_systemd_parity.SystemdStreamingParityTests) ... ok
+  test_systemd_idle_timeout_uses_stream_bound (test_streaming_systemd_parity.SystemdStreamingParityTests) ... ok
+  test_systemd_restart_during_active_stream_raises_stream_restarted (test_streaming_systemd_parity.SystemdStreamingParityTests) ... ok
+  test_systemd_restart_followed_by_eof_raises_stream_restarted (test_streaming_systemd_parity.SystemdStreamingParityTests) ... FAIL
+  test_systemd_restart_followed_by_transport_failure_raises_stream_restarted (test_streaming_systemd_parity.SystemdStreamingParityTests) ... FAIL
+  test_systemd_slow_consumer_has_bounded_behavior (test_streaming_systemd_parity.SystemdStreamingParityTests) ... ok
+  test_systemd_total_timeout_uses_monotonic_absolute_deadline (test_streaming_systemd_parity.SystemdStreamingParityTests) ... ok
+
+  ======================================================================
+  FAIL: test_systemd_concurrent_restart_during_blocked_read_raises_stream_restarted (test_streaming_systemd_parity.SystemdStreamingParityTests)
+  ----------------------------------------------------------------------
+  Traceback (most recent call last):
+    File "/home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/tests/test_streaming_systemd_parity.py", line 414, in test_systemd_concurrent_restart_during_blocked_read_raises_stream_restarted
+      self.assertIsInstance(result.get("exception"), StreamRestarted)
+  AssertionError: StreamTimeout('stream idle timeout: app-a') is not an instance of <class 'sydeco_lightml_core.worker.StreamRestarted'>
+
+  ======================================================================
+  FAIL: test_systemd_restart_followed_by_eof_raises_stream_restarted (test_streaming_systemd_parity.SystemdStreamingParityTests)
+  ----------------------------------------------------------------------
+  Traceback (most recent call last):
+    File "/home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/tests/test_streaming_systemd_parity.py", line 436, in test_systemd_restart_followed_by_eof_raises_stream_restarted
+      self.assertIsInstance(result.get("exception"), StreamRestarted)
+  AssertionError: RuntimeError('worker stream ended before terminal frame') is not an instance of <class 'sydeco_lightml_core.worker.StreamRestarted'>
+
+  ======================================================================
+  FAIL: test_systemd_restart_followed_by_transport_failure_raises_stream_restarted (test_streaming_systemd_parity.SystemdStreamingParityTests)
+  ----------------------------------------------------------------------
+  Traceback (most recent call last):
+    File "/home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/tests/test_streaming_systemd_parity.py", line 458, in test_systemd_restart_followed_by_transport_failure_raises_stream_restarted
+      self.assertIsInstance(result.get("exception"), StreamRestarted)
+  AssertionError: RuntimeError('worker stream ended before terminal frame') is not an instance of <class 'sydeco_lightml_core.worker.StreamRestarted'>
+
+  ----------------------------------------------------------------------
+  Ran 11 tests in 4.134s
+
+  FAILED (failures=3)
+
+P1 RED interpretation
+=====================
+
+Expected RED failures were reproduced:
+- blocked read after concurrent restart currently reports StreamTimeout instead
+  of StreamRestarted;
+- EOF after restart currently reports RuntimeError instead of StreamRestarted;
+- transport failure after restart currently reports RuntimeError instead of
+  StreamRestarted in this harness;
+- the tightened slow-consumer test passes and confirms current behavior is
+  exactly StreamBackpressure.
+
+P1 conclusion
+=============
+
+P1 is complete:
+- RED tests were added before production code changes;
+- the reviewer lifecycle race is reproduced deterministically;
+- no production code was changed in P1;
+- no broad redesign was introduced;
+- no secret values were copied into this evidence file.
