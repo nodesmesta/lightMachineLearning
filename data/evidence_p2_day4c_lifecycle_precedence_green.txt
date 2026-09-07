@@ -1,0 +1,74 @@
+PHASE 2 / DAY 4C - P2 LIFECYCLE PRECEDENCE GREEN
+Date: 2026-09-07
+Scope: minimal production-path fix for SystemdTransientWorkerHost.stream()
+
+Files changed for P2:
+- /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/sydeco_lightml_core/worker.py
+
+Implementation summary
+======================
+
+P2 keeps the Day 4B systemd streaming model intact and changes only lifecycle
+precedence inside SystemdTransientWorkerHost.stream().
+
+The fix adds a local helper:
+  _raise_if_stream_stale()
+
+The helper reuses the existing stream identity snapshot:
+- stream_unit
+- stream_launch_count
+- stream_secret
+
+The helper is called:
+- before each read-loop iteration interprets state;
+- immediately after line = resp.readline() returns successfully;
+- before accepting a chunk frame;
+- before accepting a completed frame;
+- before abnormal EOF is reported as protocol failure;
+- before socket.timeout is converted to StreamTimeout;
+- before ConnectionRefusedError, ConnectionResetError, or OSError is converted
+  to WorkerNotReady.
+
+Behavior intentionally preserved when the stream is not stale:
+- first-chunk, idle, and total timeout still raise StreamTimeout;
+- non-terminal EOF still fails closed;
+- transport failure still maps to WorkerNotReady;
+- adapter error and malformed protocol behavior remain unchanged;
+- public server mapping remains unchanged.
+
+Targeted GREEN command
+======================
+
+Command:
+  python3 -m unittest discover -s tests -p 'test_streaming_systemd_parity.py' -v
+
+Output:
+  test_systemd_abnormal_eof_before_terminal_frame_fails_closed (test_streaming_systemd_parity.SystemdStreamingParityTests) ... ok
+  test_systemd_adapter_error_frame_is_not_returned_as_chunk_data (test_streaming_systemd_parity.SystemdStreamingParityTests) ... ok
+  test_systemd_client_cancellation_does_not_leave_worker_busy (test_streaming_systemd_parity.SystemdStreamingParityTests) ... ok
+  test_systemd_concurrent_restart_during_blocked_read_raises_stream_restarted (test_streaming_systemd_parity.SystemdStreamingParityTests) ... ok
+  test_systemd_first_chunk_timeout_uses_stream_bound (test_streaming_systemd_parity.SystemdStreamingParityTests) ... ok
+  test_systemd_idle_timeout_uses_stream_bound (test_streaming_systemd_parity.SystemdStreamingParityTests) ... ok
+  test_systemd_restart_during_active_stream_raises_stream_restarted (test_streaming_systemd_parity.SystemdStreamingParityTests) ... ok
+  test_systemd_restart_followed_by_eof_raises_stream_restarted (test_streaming_systemd_parity.SystemdStreamingParityTests) ... ok
+  test_systemd_restart_followed_by_transport_failure_raises_stream_restarted (test_streaming_systemd_parity.SystemdStreamingParityTests) ... ok
+  test_systemd_slow_consumer_has_bounded_behavior (test_streaming_systemd_parity.SystemdStreamingParityTests) ... ok
+  test_systemd_total_timeout_uses_monotonic_absolute_deadline (test_streaming_systemd_parity.SystemdStreamingParityTests) ... ok
+
+  ----------------------------------------------------------------------
+  Ran 11 tests in 4.431s
+
+  OK
+
+P2 conclusion
+=============
+
+P2 is complete:
+- the three P1 RED lifecycle tests are GREEN;
+- stale-generation precedence now wins over blocked-read timeout, EOF after
+  restart, and active-stream transport failure after restart;
+- non-stale timeout, EOF, and transport-failure behavior remains intentionally
+  preserved by the unchanged exception mappings after stale checks;
+- no public protocol change was made;
+- no WorkerManager redesign was made;
+- no secret values were copied into this evidence file.

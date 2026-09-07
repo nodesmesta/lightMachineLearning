@@ -1105,6 +1105,10 @@ class SystemdTransientWorkerHost(WorkerHost):
                 f"worker generation recycled during stream: {self._app_id}"
             )
 
+        def _raise_if_stream_stale() -> None:
+            if _stream_stale():
+                _raise_stream_restarted()
+
         def _set_read_timeout(resp, timeout_value: float) -> None:
             if conn is not None and conn.sock is not None:
                 conn.sock.settimeout(timeout_value)
@@ -1132,8 +1136,7 @@ class SystemdTransientWorkerHost(WorkerHost):
                 raise RuntimeError(f"worker stream error {resp.status}: {data!r}")
             terminal = False
             while True:
-                if _stream_stale():
-                    _raise_stream_restarted()
+                _raise_if_stream_stale()
                 elapsed = time.monotonic() - started
                 remaining_total = timeouts["total"] - elapsed
                 if remaining_total <= 0:
@@ -1144,6 +1147,7 @@ class SystemdTransientWorkerHost(WorkerHost):
                 )
                 _set_read_timeout(resp, read_timeout)
                 line = resp.readline()
+                _raise_if_stream_stale()
                 if not line:
                     break
                 line = line.strip()
@@ -1161,8 +1165,7 @@ class SystemdTransientWorkerHost(WorkerHost):
                 if frame_type == "chunk":
                     if "data" not in obj:
                         raise RuntimeError("worker stream protocol error")
-                    if _stream_stale():
-                        _raise_stream_restarted()
+                    _raise_if_stream_stale()
                     seen = True
                     before_yield = time.monotonic()
                     yield obj["data"]
@@ -1179,11 +1182,9 @@ class SystemdTransientWorkerHost(WorkerHost):
                             "stream backpressure: consumer stalled beyond "
                             f"stream_backpressure_timeout: {self._app_id}"
                         )
-                    if _stream_stale():
-                        _raise_stream_restarted()
+                    _raise_if_stream_stale()
                 elif frame_type == "completed":
-                    if _stream_stale():
-                        _raise_stream_restarted()
+                    _raise_if_stream_stale()
                     terminal = True
                     break
                 elif frame_type == "error":
@@ -1191,9 +1192,11 @@ class SystemdTransientWorkerHost(WorkerHost):
                 else:
                     raise RuntimeError("worker stream protocol error")
             if not terminal:
+                _raise_if_stream_stale()
                 raise RuntimeError("worker stream ended before terminal frame")
             conn.close()
         except socket.timeout:
+            _raise_if_stream_stale()
             _raise_stream_timeout(_stream_timeout_reason())
         except GeneratorExit:
             if conn is not None:
@@ -1205,6 +1208,7 @@ class SystemdTransientWorkerHost(WorkerHost):
             self._recycle_after_timeout()
             raise
         except (ConnectionRefusedError, ConnectionResetError, OSError) as exc:
+            _raise_if_stream_stale()
             raise WorkerNotReady(f"worker unreachable: {self._app_id}") from exc
         finally:
             if conn is not None:
