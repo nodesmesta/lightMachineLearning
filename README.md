@@ -68,8 +68,10 @@ changes.
 | `04c3938` | Record full streaming verification |
 | `753a732` | Record regression verification |
 | `c39ddef` | Record package procedure |
+| post-review cleanup | Sync source README and close the stream cleanup warning |
 
-Current repository state after P7 package-procedure commit:
+Repository state after the P7 package-procedure commit and before post-review
+cleanup:
 
 ```text
 HEAD: c39ddef
@@ -378,11 +380,9 @@ That file is included inside the source ZIP and intentionally does not contain
 the final ZIP hash, because embedding the final ZIP hash inside the ZIP would
 create a circular hashing problem.
 
-Final source state used for packaging:
+Source hygiene state used for packaging:
 
 ```text
-HEAD: c39ddef
-commit count: 27
 git status: clean
 generated __pycache__/.pyc/.pyo entries: 0
 ```
@@ -408,13 +408,7 @@ unzip -t /home/sydeco/Dev/Task/week-6/07-09-2026/data/SYDECO_LIGHTML_V2_DEV_2026
 No errors detected in compressed data of /home/sydeco/Dev/Task/week-6/07-09-2026/data/SYDECO_LIGHTML_V2_DEV_2026-09-07.zip.
 ```
 
-SHA-256 sidecar:
-
-```text
-5dbb5f756112b39b1c13bcf939b01725ac74cbb65d6b4ff03bd8ff1f243a88d7  SYDECO_LIGHTML_V2_DEV_2026-09-07.zip
-```
-
-SHA-256 verification:
+SHA-256 sidecar verification:
 
 ```text
 sha256sum -c SYDECO_LIGHTML_V2_DEV_2026-09-07.zip.sha256
@@ -440,9 +434,8 @@ Evidence: `data/evidence_p7_day4c_package_report_hash.txt`.
 Final repository state:
 
 ```text
-HEAD: c39ddef
-commit count: 27
-git status: clean
+Recorded in the external workspace README after the final ZIP and sidecar are
+generated.
 ```
 
 Final verification summary:
@@ -481,7 +474,7 @@ Final artifact paths:
 Final SHA-256:
 
 ```text
-5dbb5f756112b39b1c13bcf939b01725ac74cbb65d6b4ff03bd8ff1f243a88d7  SYDECO_LIGHTML_V2_DEV_2026-09-07.zip
+Recorded in the external .zip.sha256 sidecar generated after the final ZIP.
 ```
 
 Explicit non-scope confirmation:
@@ -540,8 +533,8 @@ The required RED tests were added first and reproduced the reviewer issue.
 After the minimal fix, systemd parity passed `11/11`, complete K5 streaming
 passed `38/38`, full regression passed `137/137`, isolated-copy regression
 passed `137/137`, and repo-wide compile checks passed. The final source ZIP and
-external `.zip.sha256` sidecar were generated and verified from commit
-`c39ddef`.
+external `.zip.sha256` sidecar are generated after source finalization, with the
+exact archive hash recorded externally to avoid circular package metadata.
 
 Status: **SYDECO LIGHTML UNIVERSAL RUNTIME V2 - DEVELOPMENT / PROOF OF CONCEPT
 - K5 DAY 4C SUBMITTED / AWAITING REVIEW.**
