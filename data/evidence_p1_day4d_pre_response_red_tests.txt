@@ -1,0 +1,145 @@
+# P1 - Day 4D Pre-response RED Tests
+
+Date: 2026-09-08
+Source repo: /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV
+
+## Scope
+
+P1 added two focused RED tests in:
+
+```text
+/home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/tests/test_streaming_systemd_parity.py
+```
+
+The tests exercise `SystemdTransientWorkerHost.stream()` and cover the reviewer
+finding that cleanup can raise `NameError` when stream setup fails before
+`resp = conn.getresponse()` assigns a response object.
+
+Added test coverage:
+- `test_systemd_initial_connection_refused_before_response_raises_worker_not_ready`
+- `test_systemd_initial_timeout_before_response_raises_first_chunk_timeout`
+
+The timeout case uses a local TCP server that accepts the stream request but
+does not send an HTTP response, causing the timeout before an HTTP response
+object exists.
+
+No production code was changed in P1.
+
+## Test diff summary
+
+Command:
+
+```text
+git -C /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV diff -- tests/test_streaming_systemd_parity.py
+```
+
+Summary of changes:
+
+```text
+import WorkerNotReady
+add _PreResponseTimeoutServer
+add _unused_loopback_port()
+add test_systemd_initial_connection_refused_before_response_raises_worker_not_ready()
+add test_systemd_initial_timeout_before_response_raises_first_chunk_timeout()
+```
+
+## RED command
+
+Command:
+
+```text
+python3 -m unittest discover -s tests -p 'test_streaming_systemd_parity.py' -v
+```
+
+Result:
+
+```text
+test_systemd_abnormal_eof_before_terminal_frame_fails_closed ... ok
+test_systemd_adapter_error_frame_is_not_returned_as_chunk_data ... ok
+test_systemd_client_cancellation_does_not_leave_worker_busy ... ok
+test_systemd_concurrent_restart_during_blocked_read_raises_stream_restarted ... ok
+test_systemd_first_chunk_timeout_uses_stream_bound ... ok
+test_systemd_idle_timeout_uses_stream_bound ... ok
+test_systemd_initial_connection_refused_before_response_raises_worker_not_ready ... ERROR
+test_systemd_initial_timeout_before_response_raises_first_chunk_timeout ... ERROR
+test_systemd_restart_during_active_stream_raises_stream_restarted ... ok
+test_systemd_restart_followed_by_eof_raises_stream_restarted ... ok
+test_systemd_restart_followed_by_transport_failure_raises_stream_restarted ... ok
+test_systemd_slow_consumer_has_bounded_behavior ... ok
+test_systemd_total_timeout_uses_monotonic_absolute_deadline ... ok
+
+Ran 13 tests in 5.446s
+
+FAILED (errors=2)
+```
+
+## RED failure details
+
+Connection refused before response assignment:
+
+```text
+ConnectionRefusedError: [Errno 111] Connection refused
+...
+sydeco_lightml_core.worker.WorkerNotReady: worker unreachable: app-a
+...
+File ".../sydeco_lightml_core/worker.py", line 1211, in stream
+    _close_stream_connection()
+File ".../sydeco_lightml_core/worker.py", line 1096, in _close_stream_connection
+    if resp is not None:
+NameError: free variable 'resp' referenced before assignment in enclosing scope
+```
+
+Socket timeout before response assignment:
+
+```text
+TimeoutError: timed out
+...
+File ".../sydeco_lightml_core/worker.py", line 1201, in stream
+    _raise_stream_timeout(_stream_timeout_reason())
+File ".../sydeco_lightml_core/worker.py", line 1079, in _raise_stream_timeout
+    _close_stream_connection()
+File ".../sydeco_lightml_core/worker.py", line 1096, in _close_stream_connection
+    if resp is not None:
+NameError: free variable 'resp' referenced before assignment in enclosing scope
+```
+
+Observed non-final warning during RED failure run:
+
+```text
+ResourceWarning: unclosed <socket.socket ...>
+```
+
+This was observed during the failing RED state. P3 will rerun systemd parity with
+`-W error::ResourceWarning` after P2 applies the production fix.
+
+## Git status after P1
+
+Command:
+
+```text
+git -C /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV status --short
+```
+
+Output:
+
+```text
+ M tests/test_streaming_systemd_parity.py
+```
+
+Generated Python cache artifacts after the P1 test run:
+
+```text
+8
+```
+
+These are generated test artifacts and must be cleaned before final packaging,
+after user approval at the appropriate phase.
+
+## P1 result
+
+P1 is complete. The RED tests reproduce the reviewer-reported pre-response
+cleanup regression before any production code fix.
+
+Next section requires user confirmation:
+- P2 apply the surgical `resp = None` initialization fix in
+  `SystemdTransientWorkerHost.stream()`.

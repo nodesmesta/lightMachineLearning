@@ -1057,6 +1057,7 @@ class SystemdTransientWorkerHost(WorkerHost):
         if self._secret is not None:
             headers["Authorization"] = "Bearer " + self._secret
         conn = None
+        resp = None
         limits = self._last_context.get("config", {}).get("resource_limits", {})
         timeouts = _stream_timeouts(limits, self._timeout)
         try:

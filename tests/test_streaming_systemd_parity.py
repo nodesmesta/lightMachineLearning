@@ -25,6 +25,7 @@ from sydeco_lightml_core.worker import (
     StreamRestarted,
     StreamTimeout,
     SystemdTransientWorkerHost,
+    WorkerNotReady,
 )
 
 
@@ -127,6 +128,59 @@ class _ScriptedWorkerServer:
         if self.httpd is not None:
             self.httpd.shutdown()
             self.httpd.server_close()
+
+
+class _PreResponseTimeoutServer:
+    def __init__(self) -> None:
+        self.port = 0
+        self.accepted = threading.Event()
+        self._stop = threading.Event()
+        self._sock: socket.socket | None = None
+        self._client: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        self._sock = sock
+        self.port = sock.getsockname()[1]
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        for sock in (self._client, self._sock):
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def _serve(self) -> None:
+        if self._sock is None:
+            return
+        try:
+            client, _addr = self._sock.accept()
+        except OSError:
+            return
+        self._client = client
+        self.accepted.set()
+        try:
+            client.settimeout(0.1)
+            try:
+                client.recv(4096)
+            except OSError:
+                pass
+            self._stop.wait(timeout=2.0)
+        finally:
+            try:
+                client.close()
+            except OSError:
+                pass
 
 
 def _sleep_before_first_chunk(handler: BaseHTTPRequestHandler, _server: _ScriptedWorkerServer) -> None:
@@ -291,6 +345,14 @@ class SystemdStreamingParityTests(unittest.TestCase):
         reader.start()
         return reader, read_entered, result
 
+    def _unused_loopback_port(self) -> int:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind(("127.0.0.1", 0))
+            return sock.getsockname()[1]
+        finally:
+            sock.close()
+
     def test_systemd_first_chunk_timeout_uses_stream_bound(self) -> None:
         host, _fake, _server = self._start_host(
             _sleep_before_first_chunk,
@@ -340,6 +402,42 @@ class SystemdStreamingParityTests(unittest.TestCase):
             list(host.stream({"text": "hello"}, "r-total"))
 
         self.assertEqual(raised.exception.reason, "total")
+
+    def test_systemd_initial_connection_refused_before_response_raises_worker_not_ready(self) -> None:
+        host, _fake, _server = self._start_host(
+            _slow_stream,
+            limits={
+                "inference_timeout": 1.0,
+                "stream_first_chunk_timeout": 0.2,
+                "stream_idle_timeout": 1.0,
+                "stream_total_timeout": 1.0,
+            },
+        )
+        host._port = self._unused_loopback_port()
+
+        with self.assertRaises(WorkerNotReady):
+            list(host.stream({"text": "hello"}, "r-pre-response-refused"))
+
+    def test_systemd_initial_timeout_before_response_raises_first_chunk_timeout(self) -> None:
+        timeout_server = _PreResponseTimeoutServer()
+        timeout_server.start()
+        self.addCleanup(timeout_server.stop)
+        host, _fake, _server = self._start_host(
+            _slow_stream,
+            limits={
+                "inference_timeout": 1.0,
+                "stream_first_chunk_timeout": 0.1,
+                "stream_idle_timeout": 1.0,
+                "stream_total_timeout": 1.0,
+            },
+        )
+        host._port = timeout_server.port
+
+        with self.assertRaises(StreamTimeout) as raised:
+            list(host.stream({"text": "hello"}, "r-pre-response-timeout"))
+
+        self.assertEqual(raised.exception.reason, "first_chunk")
+        self.assertTrue(timeout_server.accepted.is_set())
 
     def test_systemd_adapter_error_frame_is_not_returned_as_chunk_data(self) -> None:
         host, _fake, _server = self._start_host(

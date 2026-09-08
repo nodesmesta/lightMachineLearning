@@ -1,0 +1,229 @@
+# P0 - Day 4D Baseline
+
+Date: 2026-09-08
+Workspace: /home/sydeco/Dev/Task/week-6/08-09-2026
+Source repo: /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV
+Review input: /home/sydeco/Dev/Task/week-6/08-09-2026/SYDECO LIGHTML JAMALUDIN 7 SEPT REVIEWED.docx
+
+## Reviewer finding
+
+The 07-09 reviewed report says the Day 4C K5 lifecycle correction is very near
+acceptance, but the submitted artifact is revision-required. J4B is not
+authorized yet.
+
+Reviewer-required Day 4D scope:
+- do not start J4B;
+- correct the pre-response cleanup regression in
+  SystemdTransientWorkerHost.stream();
+- add two regression tests proving the pre-response failures do not return
+  NameError or UnboundLocalError;
+- run systemd parity with ResourceWarning hardened to error;
+- rerun complete K5 streaming, full regression, isolated regression, and
+  py_compile;
+- rebuild one canonical 2026-09-08 source ZIP using git archive;
+- generate one external .zip.sha256 sidecar after the ZIP is final;
+- regenerate the final daily report from the final source state.
+
+## Source repo baseline
+
+Command:
+
+```text
+git -C /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV status --short
+```
+
+Output:
+
+```text
+<no output>
+```
+
+Command:
+
+```text
+git -C /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV rev-parse --short HEAD
+```
+
+Output:
+
+```text
+01d8e9f
+```
+
+Command:
+
+```text
+git -C /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV rev-list --count HEAD
+```
+
+Output:
+
+```text
+29
+```
+
+Command:
+
+```text
+git -C /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV log --oneline -3
+```
+
+Output:
+
+```text
+01d8e9f Avoid stale final package metadata in README
+da9419d Close Day 4C review cleanup
+c39ddef Record Day 4C package procedure
+```
+
+## stream() baseline
+
+Inspected:
+
+```text
+/home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/sydeco_lightml_core/worker.py
+```
+
+Relevant lines:
+
+```text
+1059        conn = None
+1060        limits = self._last_context.get("config", {}).get("resource_limits", {})
+...
+1095        def _close_stream_connection() -> None:
+1096            if resp is not None:
+1097                try:
+1098                    resp.close()
+1099                except Exception:
+1100                    pass
+1101            if conn is not None:
+1102                try:
+1103                    conn.close()
+1104                except Exception:
+1105                    pass
+...
+1132            resp = conn.getresponse()
+```
+
+Baseline finding:
+- `conn = None` exists before connection setup.
+- `resp = None` is missing before `_close_stream_connection()` can access
+  `resp`.
+- `resp` is only assigned after `conn.getresponse()`.
+- This matches the reviewer finding that setup failures before response
+  assignment can be masked by NameError during cleanup.
+
+## Existing systemd parity test baseline
+
+Inspected:
+
+```text
+/home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/tests/test_streaming_systemd_parity.py
+```
+
+Existing test methods:
+
+```text
+294:    def test_systemd_first_chunk_timeout_uses_stream_bound(self) -> None:
+310:    def test_systemd_idle_timeout_uses_stream_bound(self) -> None:
+328:    def test_systemd_total_timeout_uses_monotonic_absolute_deadline(self) -> None:
+344:    def test_systemd_adapter_error_frame_is_not_returned_as_chunk_data(self) -> None:
+360:    def test_systemd_abnormal_eof_before_terminal_frame_fails_closed(self) -> None:
+376:    def test_systemd_restart_during_active_stream_raises_stream_restarted(self) -> None:
+397:    def test_systemd_concurrent_restart_during_blocked_read_raises_stream_restarted(self) -> None:
+426:    def test_systemd_restart_followed_by_eof_raises_stream_restarted(self) -> None:
+454:    def test_systemd_restart_followed_by_transport_failure_raises_stream_restarted(self) -> None:
+482:    def test_systemd_client_cancellation_does_not_leave_worker_busy(self) -> None:
+505:    def test_systemd_slow_consumer_has_bounded_behavior(self) -> None:
+```
+
+Baseline finding:
+- current systemd parity test count is 11 methods;
+- no pre-response connection-refused regression test exists yet;
+- no pre-response socket-timeout regression test exists yet.
+
+Search command:
+
+```text
+rg -n "pre-response|connection refused|ConnectionRefusedError|UnboundLocalError|NameError|first_chunk.*response|socket timeout" \
+  /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/tests/test_streaming_systemd_parity.py \
+  /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/sydeco_lightml_core/worker.py
+```
+
+Output:
+
+```text
+/home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/sydeco_lightml_core/worker.py:1027:        except (ConnectionRefusedError, ConnectionResetError, OSError):
+/home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/sydeco_lightml_core/worker.py:1207:        except (ConnectionRefusedError, ConnectionResetError, OSError) as exc:
+```
+
+## 07-09 package/report mismatch baseline
+
+The 07-09 workspace README records stale package/report values:
+
+```text
+/home/sydeco/Dev/Task/week-6/07-09-2026/README.md:75:HEAD: c39ddef
+/home/sydeco/Dev/Task/week-6/07-09-2026/README.md:76:commit count: 27
+/home/sydeco/Dev/Task/week-6/07-09-2026/README.md:414:5dbb5f756112b39b1c13bcf939b01725ac74cbb65d6b4ff03bd8ff1f243a88d7  SYDECO_LIGHTML_V2_DEV_2026-09-07.zip
+```
+
+Actual 07-09 ZIP hash currently present:
+
+```text
+6ed52d77641ea09a9d86bcb5ed1928e72821867420980d813e73881627a9fe6b  SYDECO_LIGHTML_V2_DEV_2026-09-07.zip
+```
+
+Command:
+
+```text
+cd /home/sydeco/Dev/Task/week-6/07-09-2026/data
+unzip -l SYDECO_LIGHTML_V2_DEV_2026-09-07.zip | rg -c 'SYDECO_LIGHTML_V2_DEV/\.git/'
+```
+
+Output:
+
+```text
+470
+```
+
+Baseline finding:
+- the current 07-09 ZIP hash matches the reviewer-observed `6ed52d...` value,
+  not the stale `5dbb5f...` value in the report/README;
+- the current 07-09 ZIP contains 470 `.git/` entries;
+- the Day 4D package must therefore be rebuilt with `git archive` and a fresh
+  2026-09-08 external `.zip.sha256` sidecar.
+
+## Workspace baseline
+
+The 08-09 workspace initially contained only:
+
+```text
+.~lock.SYDECO LIGHTML JAMALUDIN 7 SEPT REVIEWED.docx#
+SYDECO LIGHTML JAMALUDIN 7 SEPT REVIEWED.docx
+```
+
+This P0 section added:
+
+```text
+task.md
+data/evidence_p0_day4d_baseline.txt
+```
+
+## Non-scope confirmation
+
+Do not start:
+- J4B Dependency Artifact Authenticity;
+- CRA integration;
+- F4/F6 schema migration/update handling;
+- production signing;
+- permanent installer/unit acceptance;
+- LightML 1.0.1 changes;
+- WorkerManager redesign;
+- new streaming protocol work.
+
+## P0 result
+
+P0 baseline is complete. No source code was edited during P0.
+
+Next section requires user confirmation before source edits:
+- P1 add RED tests for pre-response cleanup failures.

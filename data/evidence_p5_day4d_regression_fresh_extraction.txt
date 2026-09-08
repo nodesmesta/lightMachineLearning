@@ -1,0 +1,185 @@
+# P5 - Day 4D Full Regression And Isolated Copy
+
+Date: 2026-09-08
+Source repo: /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV
+Isolated copy: /tmp/sydeco_day4d_p5_verify.Hsk2rI/SYDECO_LIGHTML_V2_DEV
+
+## Main repository full regression
+
+Command:
+
+```text
+python3 -m unittest discover -s tests -v
+```
+
+Result:
+
+```text
+Ran 139 tests in 428.828s
+
+OK
+```
+
+Observed expected negative-path logs during tests:
+- dependency-isolation BrokenPipe traces;
+- adapter inference exception trace;
+- image parser negative-case trace;
+- streaming contract/security negative-case traces.
+
+All affected tests completed with `ok`, and the final suite result was `OK`.
+
+## Isolated copy setup
+
+Command:
+
+```text
+mktemp -d /tmp/sydeco_day4d_p5_verify.XXXXXX
+```
+
+Output:
+
+```text
+/tmp/sydeco_day4d_p5_verify.Hsk2rI
+```
+
+Command:
+
+```text
+rsync -a --exclude .git --exclude __pycache__ --exclude '*.pyc' --exclude '*.pyo' \
+  /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/ \
+  /tmp/sydeco_day4d_p5_verify.Hsk2rI/SYDECO_LIGHTML_V2_DEV/
+```
+
+Initial isolated copy `.git` count:
+
+```text
+0
+```
+
+## Isolated copy full regression
+
+Command:
+
+```text
+python3 -m unittest discover -s tests -v
+```
+
+Working directory:
+
+```text
+/tmp/sydeco_day4d_p5_verify.Hsk2rI/SYDECO_LIGHTML_V2_DEV
+```
+
+Result:
+
+```text
+Ran 139 tests in 445.574s
+
+OK
+```
+
+Observed expected negative-path logs during tests:
+- dependency-isolation BrokenPipe traces;
+- adapter inference exception trace;
+- image parser negative-case trace;
+- streaming contract/security negative-case traces.
+
+All affected tests completed with `ok`, and the final suite result was `OK`.
+
+## py_compile
+
+Main repository command:
+
+```text
+find /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV -name '*.py' -print0 | xargs -0 python3 -m py_compile
+```
+
+Result:
+
+```text
+<no output; command exited 0>
+```
+
+Isolated copy command:
+
+```text
+find /tmp/sydeco_day4d_p5_verify.Hsk2rI/SYDECO_LIGHTML_V2_DEV -name '*.py' -print0 | xargs -0 python3 -m py_compile
+```
+
+Result:
+
+```text
+<no output; command exited 0>
+```
+
+## Cache artifact count after tests and compile
+
+Main repository:
+
+```text
+52
+```
+
+Isolated copy:
+
+```text
+52
+```
+
+These are generated test/compile artifacts. They must be removed before final
+packaging, after user approval for cleanup/final packaging.
+
+## Scope check
+
+Search command:
+
+```text
+rg -n "J4B|CRA|production signing|PRODUCTION|LightML 1\\.0\\.1|WorkerManager redesign|WebSocket|SSE" \
+  /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/sydeco_lightml_core \
+  /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/tests \
+  /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/README.md
+```
+
+Result:
+
+```text
+Matches are existing README scope statements, existing worker comments, and
+existing development-test-key labels. No Day 4D source change starts J4B, CRA,
+F4/F6, production signing, LightML 1.0.1, WorkerManager redesign, WebSocket, or
+SSE work.
+```
+
+## Current source status
+
+Command:
+
+```text
+git -C /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV status --short
+```
+
+Output:
+
+```text
+ M sydeco_lightml_core/worker.py
+ M tests/test_streaming_systemd_parity.py
+```
+
+Diff stat:
+
+```text
+ sydeco_lightml_core/worker.py          |  1 +
+ tests/test_streaming_systemd_parity.py | 98 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 99 insertions(+)
+```
+
+## P5 result
+
+P5 is complete:
+- main repository full regression passed 139/139;
+- isolated-copy full regression passed 139/139;
+- main repository py_compile passed;
+- isolated-copy py_compile passed.
+
+Next section requires user confirmation:
+- cleanup generated cache artifacts and proceed toward final source/document
+  update before package generation.

@@ -1,0 +1,99 @@
+# P3 - Day 4D Systemd Parity With ResourceWarning Hardened
+
+Date: 2026-09-08
+Source repo: /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV
+
+## Command
+
+```text
+python3 -W error::ResourceWarning -m unittest discover -s tests -p 'test_streaming_systemd_parity.py' -v
+```
+
+## Result
+
+```text
+test_systemd_abnormal_eof_before_terminal_frame_fails_closed ... ok
+test_systemd_adapter_error_frame_is_not_returned_as_chunk_data ... ok
+test_systemd_client_cancellation_does_not_leave_worker_busy ... ok
+test_systemd_concurrent_restart_during_blocked_read_raises_stream_restarted ... ok
+test_systemd_first_chunk_timeout_uses_stream_bound ... ok
+test_systemd_idle_timeout_uses_stream_bound ... ok
+test_systemd_initial_connection_refused_before_response_raises_worker_not_ready ... ok
+test_systemd_initial_timeout_before_response_raises_first_chunk_timeout ... ok
+test_systemd_restart_during_active_stream_raises_stream_restarted ... ok
+test_systemd_restart_followed_by_eof_raises_stream_restarted ... ok
+test_systemd_restart_followed_by_transport_failure_raises_stream_restarted ... ok
+test_systemd_slow_consumer_has_bounded_behavior ... ok
+test_systemd_total_timeout_uses_monotonic_absolute_deadline ... ok
+
+Ran 13 tests in 5.060s
+
+OK
+```
+
+## Coverage count
+
+Current systemd parity tests:
+
+```text
+13
+```
+
+Test methods:
+
+```text
+test_systemd_first_chunk_timeout_uses_stream_bound
+test_systemd_idle_timeout_uses_stream_bound
+test_systemd_total_timeout_uses_monotonic_absolute_deadline
+test_systemd_initial_connection_refused_before_response_raises_worker_not_ready
+test_systemd_initial_timeout_before_response_raises_first_chunk_timeout
+test_systemd_adapter_error_frame_is_not_returned_as_chunk_data
+test_systemd_abnormal_eof_before_terminal_frame_fails_closed
+test_systemd_restart_during_active_stream_raises_stream_restarted
+test_systemd_concurrent_restart_during_blocked_read_raises_stream_restarted
+test_systemd_restart_followed_by_eof_raises_stream_restarted
+test_systemd_restart_followed_by_transport_failure_raises_stream_restarted
+test_systemd_client_cancellation_does_not_leave_worker_busy
+test_systemd_slow_consumer_has_bounded_behavior
+```
+
+## Environment note
+
+An initial sandboxed run of the same command failed before executing the test
+logic because loopback socket creation raised:
+
+```text
+PermissionError: [Errno 1] Operation not permitted
+```
+
+The command was rerun with approval outside the sandbox. The approved run is the
+P3 evidence result above.
+
+## Current source status
+
+Command:
+
+```text
+git -C /home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV status --short
+```
+
+Output:
+
+```text
+ M sydeco_lightml_core/worker.py
+ M tests/test_streaming_systemd_parity.py
+```
+
+Generated Python cache artifacts after P3:
+
+```text
+8
+```
+
+These are generated test artifacts and must be cleaned before final packaging,
+after user approval at the appropriate phase.
+
+## P3 result
+
+P3 is complete. The full systemd parity file passes 13/13 with
+`ResourceWarning` treated as an error.
