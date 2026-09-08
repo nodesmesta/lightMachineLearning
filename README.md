@@ -386,8 +386,13 @@ report record the exact ZIP filename, SHA-256 value, and verification output.
 
 The external 08-09 workspace contains the final package integrity evidence,
 external checksum sidecar evidence, regenerated daily report evidence, and final
-handoff summary. J4B Dependency Artifact Authenticity starts only after reviewer
-acceptance of this K5 Day 4D correction.
+handoff summary.
+
+J4B Dependency Artifact Authenticity and the other deferred LightML V2 roadmap
+items start only after reviewer authorization. If K5 remains blocking, the
+project needs a concrete list of the remaining K5 findings and exit criteria so
+the next correction can target a defined technical issue instead of keeping the
+roadmap open-ended.
 
 ## Constraints Honored
 
@@ -417,5 +422,37 @@ systemd parity passed `13/13`, complete K5 streaming passed `40/40`, full
 regression passed `139/139`, isolated-copy regression passed `139/139`, and
 compile checks passed in both source locations.
 
+This report does not self-declare K5 accepted. Reviewer acceptance remains the
+reviewer's responsibility. However, the current review flow has created a
+practical development blockage: the team has spent more than one week constrained
+almost exclusively to K5 while the broader LightML V2 roadmap remains paused.
+This is now also a scope-management issue, not only a technical correction issue.
+
+If K5 still cannot be left, the reviewer needs to provide the exact remaining K5
+issues and clear exit criteria. An open-ended instruction to remain in K5 is not
+sufficient for project execution, because the team cannot reasonably know when
+K5 is considered sufficient or what technical target must be corrected next.
+
+To keep LightML V2 moving while preserving reviewer control, we request
+authorization to continue development in separated phases:
+
+1. K5 Correction Phase
+
+   Dedicated only to any remaining K5 reviewer findings, with isolated commits,
+   isolated evidence, and no contamination of other workstreams.
+
+2. Next Development Phase
+
+   A separate phase for the next LightML V2 roadmap item, such as J4B Dependency
+   Artifact Authenticity, F4/F6 update and schema migration handling,
+   installer/unit acceptance, production signing, or another reviewer-approved
+   item.
+
+If the reviewer believes K5 is still blocking, please provide the exact remaining
+K5 issues now. If no concrete remaining K5 issue is provided, the team requests
+permission to proceed with the next development phase separately while keeping
+K5 evidence available for review.
+
 Status: **SYDECO LIGHTML UNIVERSAL RUNTIME V2 - DEVELOPMENT / PROOF OF CONCEPT
-- K5 DAY 4D CORRECTION PREPARED FOR CANONICAL HANDOFF / AWAITING REVIEW.**
+- K5 DAY 4D CORRECTION PREPARED FOR CANONICAL HANDOFF / AWAITING REVIEW;
+NEXT PHASE REQUESTED SUBJECT TO REVIEWER AUTHORIZATION.**
