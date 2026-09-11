@@ -1175,6 +1175,7 @@ class SystemdTransientWorkerHost(WorkerHost):
                     seen = True
                     before_yield = time.monotonic()
                     yield obj["data"]
+                    _raise_if_stream_stale()
                     if (
                         bp_timeout is not None
                         and time.monotonic() - before_yield > bp_timeout
@@ -1184,7 +1185,6 @@ class SystemdTransientWorkerHost(WorkerHost):
                             "stream backpressure: consumer stalled beyond "
                             f"stream_backpressure_timeout: {self._app_id}"
                         )
-                    _raise_if_stream_stale()
                 elif frame_type == "completed":
                     _raise_if_stream_stale()
                     terminal = True
