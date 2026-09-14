@@ -38,6 +38,7 @@ from .manifest import (
     MODEL_FORMAT_WHITELIST,
     REQUIRED_MANIFEST_FIELDS,
 )
+from .network_policy import ALLOWED_NETWORK_POLICIES
 
 SEMVER_PATTERN = re.compile(r"^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -206,9 +207,20 @@ def validate_manifest(manifest: Dict[str, Any]) -> Tuple[bool, List[str]]:
         if key in manifest and not isinstance(manifest[key], dict):
             errors.append(f"{key} must be a JSON Schema object")
 
-    # permissions (O4): if present, must be an object
-    if "permissions" in manifest and not isinstance(manifest["permissions"], dict):
+    # permissions (O4): fail closed; network policy must be explicit
+    if "permissions" not in manifest:
+        errors.append("permissions missing: network policy must be explicit")
+    elif not isinstance(manifest["permissions"], dict):
         errors.append("permissions must be an object")
+    else:
+        network = manifest["permissions"].get("network")
+        if network is None:
+            errors.append("permissions.network missing")
+        elif network not in ALLOWED_NETWORK_POLICIES:
+            errors.append(
+                "permissions.network must be one of "
+                f"{sorted(ALLOWED_NETWORK_POLICIES)}, got: {network!r}"
+            )
 
     # dependencies (J2/J4): if present, list of {name, version}
     if "dependencies" in manifest:

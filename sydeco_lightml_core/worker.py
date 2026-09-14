@@ -26,6 +26,7 @@ from typing import Any, Callable, Dict, Optional, Union
 
 from .adapter import Adapter
 from .health import AppStatus, ReadinessStore
+from .network_policy import adapter_network_guard
 
 
 class WorkerHost(abc.ABC):
@@ -228,10 +229,11 @@ class InProcessWorkerHost(WorkerHost):
             self._secret = secrets.token_hex(32)
             factory = self._adapter_factory
 
-        if candidate is None:
-            assert factory is not None
-            candidate = factory()
-        candidate.initialize(context)
+        with adapter_network_guard(context):
+            if candidate is None:
+                assert factory is not None
+                candidate = factory()
+            candidate.initialize(context)
 
         with self._lifecycle_lock:
             stale = self._stopped or generation != self._generation
@@ -253,7 +255,11 @@ class InProcessWorkerHost(WorkerHost):
             context["request_id"] = request_id
             generation = self._generation
             adapter = self._adapter
-            future = self._executor.submit(adapter.infer, request, context)
+            def _run_infer() -> Any:
+                with adapter_network_guard(context):
+                    return adapter.infer(request, context)
+
+            future = self._executor.submit(_run_infer)
         try:
             result = future.result(timeout=self._timeout)
         except concurrent.futures.CancelledError as exc:
@@ -354,17 +360,18 @@ class InProcessWorkerHost(WorkerHost):
             iterator = None
             backpressured = False
             try:
-                iterator = iter(stream_fn(request, context))
-                while not cancel.is_set():
-                    try:
-                        chunk = next(iterator)
-                    except StopIteration:
-                        break
-                    if not _put_chunk(("chunk", chunk)):
-                        backpressured = not cancel.is_set()
-                        break
-                if not cancel.is_set() and not backpressured:
-                    _put_cancellable(("done", done))
+                with adapter_network_guard(context):
+                    iterator = iter(stream_fn(request, context))
+                    while not cancel.is_set():
+                        try:
+                            chunk = next(iterator)
+                        except StopIteration:
+                            break
+                        if not _put_chunk(("chunk", chunk)):
+                            backpressured = not cancel.is_set()
+                            break
+                    if not cancel.is_set() and not backpressured:
+                        _put_cancellable(("done", done))
             except BaseException as exc:  # propagate sanitized by server layer
                 if not cancel.is_set():
                     _put_cancellable(("error", exc))
@@ -513,8 +520,9 @@ class InProcessWorkerHost(WorkerHost):
                 raise RuntimeError(
                     "cannot recover timed-out in-process adapter without a factory"
                 )
-            replacement = factory()
-            replacement.initialize(context)
+            with adapter_network_guard(context):
+                replacement = factory()
+                replacement.initialize(context)
             with self._lifecycle_lock:
                 if (
                     self._stopped
@@ -604,9 +612,10 @@ class InProcessWorkerHost(WorkerHost):
             current = self._adapter
             context = dict(self._context)
 
-        replacement = factory() if factory is not None else current
-        assert replacement is not None
-        replacement.initialize(context)
+        with adapter_network_guard(context):
+            replacement = factory() if factory is not None else current
+            assert replacement is not None
+            replacement.initialize(context)
 
         with self._lifecycle_lock:
             stale = self._stopped or generation != self._generation

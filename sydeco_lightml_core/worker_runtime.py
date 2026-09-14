@@ -41,6 +41,7 @@ from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 from . import loader
+from .network_policy import adapter_network_guard
 
 log = logging.getLogger("sydeco-lightml.worker-runtime")
 
@@ -275,12 +276,14 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     self.send_header("Content-Type", "application/x-ndjson")
                     self.send_header("Connection", "close")
                     self.end_headers()
-                    for chunk in stream_fn(request, context):
-                        self._send_stream_frame({"type": "chunk", "data": chunk})
+                    with adapter_network_guard(context):
+                        for chunk in stream_fn(request, context):
+                            self._send_stream_frame({"type": "chunk", "data": chunk})
                     self._send_stream_frame({"type": "completed"})
                     self.close_connection = True
                     return
-                result = runtime.adapter.infer(request, context)
+                with adapter_network_guard(context):
+                    result = runtime.adapter.infer(request, context)
             except Exception:
                 log.exception("adapter.%s failed", "stream" if path == "/stream" else "infer")
                 if path == "/stream":
@@ -328,7 +331,9 @@ def run_worker(
     # A1: models load INSIDE this worker process (E5 re-verified here).
     models = loader.load_artifacts(manifest, app_root)
 
-    adapter = load_adapter(manifest, app_root)
+    context = build_context(manifest, models, data_dir)
+    with adapter_network_guard(context):
+        adapter = load_adapter(manifest, app_root)
 
     if data_dir:
         os.makedirs(data_dir, exist_ok=True)
@@ -337,8 +342,8 @@ def run_worker(
     # fails closed when none is configured (see load_worker_secret).
     worker_secret = load_worker_secret(credential_file)
 
-    context = build_context(manifest, models, data_dir)
-    adapter.initialize(context)  # R4: failure -> not ready -> unit fails
+    with adapter_network_guard(context):
+        adapter.initialize(context)  # R4: failure -> not ready -> unit fails
 
     runtime = _SimpleNamespace(
         adapter=adapter,
