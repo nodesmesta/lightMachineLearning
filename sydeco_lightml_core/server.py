@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from .health import AppStatus
+from .ingress import IngestError
 from .schema import validate_schema
 from .secrets import verify_token
 from .worker import (
@@ -44,6 +45,7 @@ DEFAULT_BODY_LIMIT = 1 * 1024 * 1024  # K5 default (1 MiB)
 READY_WAIT_SECONDS = 30.0  # G3 bounded wait during start/restart
 
 _INFER_RE = re.compile(r"^/api/v1/apps/(?P<app_id>[a-z0-9-]+)/infer$")
+_INGEST_RE = re.compile(r"^/api/v1/apps/(?P<app_id>[a-z0-9-]+)/ingest$")
 
 
 def new_request_id() -> str:
@@ -188,6 +190,10 @@ class CoreHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
+        match = _INGEST_RE.match(path)
+        if match:
+            self._handle_ingest(match.group("app_id"))
+            return
         match = _INFER_RE.match(path)
         if not match:
             self._send_json(404, {
@@ -196,6 +202,77 @@ class CoreHandler(BaseHTTPRequestHandler):
             })
             return
         self._handle_infer(match.group("app_id"))
+
+    def _handle_ingest(self, app_id: str) -> None:
+        """Generic bounded local file ingestion.
+
+        Core stores raw bytes under an app-scoped ingress area and returns a
+        short-lived reference. It does not interpret document type or content.
+        """
+        service = self.server.service
+        request_id = new_request_id()
+        started = time.time()
+        info = service.router.resolve(app_id)
+        if info is None:
+            self._send_json(404, {
+                "error": {"code": "404", "message": f"unknown app: {app_id}"},
+                "request_id": request_id,
+            })
+            return
+        manifest = info.get("manifest", {})
+        if not self._auth_ok(app_id, manifest):
+            self._audit(app_id, request_id, "fail", 0, 401, "auth")
+            self._send_json(401, {
+                "error": {"code": "401", "message": "missing or invalid token"},
+                "request_id": request_id,
+            })
+            return
+        length = self.headers.get("Content-Length")
+        try:
+            content_length = int(length) if length is not None else -1
+        except ValueError:
+            content_length = -1
+        if content_length < 0:
+            self._audit(app_id, request_id, "fail", 0, 400, "missing content length")
+            self._send_json(400, {
+                "error": {"code": "400", "message": "missing or invalid Content-Length"},
+                "request_id": request_id,
+            })
+            return
+        try:
+            upload = service.ingress.create(
+                app_id=app_id,
+                manifest=manifest,
+                rfile=self.rfile,
+                content_length=content_length,
+                filename=self.headers.get("X-LightML-Filename", "upload.bin"),
+                content_type=self.headers.get("Content-Type", "application/octet-stream"),
+            )
+        except IngestError as exc:
+            self._audit(app_id, request_id, "fail", 0, exc.status, exc.message)
+            self._send_json(exc.status, {
+                "error": {"code": str(exc.status), "message": exc.message},
+                "request_id": request_id,
+            })
+            return
+        except Exception:
+            log.exception("ingest failed for %s", app_id)
+            self._audit(app_id, request_id, "fail", 0, 500, "ingest exception")
+            self._send_json(500, {
+                "error": {"code": "500", "message": "internal error"},
+                "request_id": request_id,
+            })
+            return
+        duration_ms = int((time.time() - started) * 1000)
+        self._audit(app_id, request_id, "ok", duration_ms, 200, "ingest")
+        public_upload = {k: upload[k] for k in (
+            "file_ref", "filename", "content_type", "size_bytes", "expires_at_epoch"
+        )}
+        self._send_json(200, {
+            "request_id": request_id,
+            "app": app_id,
+            "upload": public_upload,
+        })
 
     def _handle_infer(self, app_id: str) -> None:
         service = self.server.service
@@ -277,6 +354,25 @@ class CoreHandler(BaseHTTPRequestHandler):
             })
             return
 
+        consumed_file_refs: List[str] = []
+        resolved_items: List[Dict[str, Any]] = []
+        for item in items:
+            prepared = dict(item)
+            if "file_ref" in prepared:
+                try:
+                    file_obj = service.ingress.resolve(app_id, prepared["file_ref"])
+                except IngestError as exc:
+                    self._audit(app_id, request_id, "fail", 0, exc.status, exc.message)
+                    self._send_json(exc.status, {
+                        "error": {"code": str(exc.status), "message": exc.message},
+                        "request_id": request_id,
+                    })
+                    return
+                prepared["file"] = file_obj
+                consumed_file_refs.append(str(prepared["file_ref"]))
+            resolved_items.append(prepared)
+        items = resolved_items
+
         # G2/G3 readiness gate (target app only)
         ok, status = self._ready_or_wait(app_id)
         if not ok:
@@ -335,6 +431,9 @@ class CoreHandler(BaseHTTPRequestHandler):
                 "request_id": request_id,
             })
             return
+        finally:
+            for file_ref in consumed_file_refs:
+                service.ingress.consume(app_id, file_ref)
 
         # H2: output validated against output_schema BEFORE the envelope
         output_schema = manifest.get("output_schema", {})

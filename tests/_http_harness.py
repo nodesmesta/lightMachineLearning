@@ -72,6 +72,32 @@ class HttpHarness:
             "POST", f"/api/v1/apps/{app_id}/infer", payload=payload, token=token
         )
 
+    def ingest(
+        self,
+        app_id: str,
+        data: bytes,
+        token: str,
+        filename: str = "upload.bin",
+        content_type: str = "application/octet-stream",
+    ) -> tuple:
+        url = f"http://127.0.0.1:{self.port}/api/v1/apps/{app_id}/ingest"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": content_type,
+            "X-LightML-Filename": filename,
+        }
+        req = urllib.request.Request(url, data=data, method="POST", headers=headers)
+        try:
+            with urllib.request.urlopen(req) as resp:
+                body = resp.read().decode("utf-8")
+                return resp.status, json.loads(body) if body else None
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8")
+            try:
+                return exc.code, json.loads(body)
+            except (json.JSONDecodeError, ValueError):
+                return exc.code, body
+
     def request_declared(
         self,
         method: str,

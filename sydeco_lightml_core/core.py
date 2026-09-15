@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .audit import JsonlAuditBackend
 from .health import AppStatus, ReadinessStore
+from .ingress import IngressStore
 from .keys import verify_bundle_signature
 from .loader import load_artifacts
 from .manifest import load_manifest
@@ -67,6 +68,7 @@ class CoreService:
         self.worker_mode = worker_mode  # "inprocess" (dev/tests) | "systemd" (D1c)
         self.audit = JsonlAuditBackend(os.path.join(self.data_dir, "audit"))
         self.registry = Registry(self.data_dir, audit=self.audit)
+        self.ingress = IngressStore(self.data_dir)
         self.router = Router(self.registry)
         self.readiness = ReadinessStore()
         self.worker_manager = WorkerManager(readiness=self.readiness)
@@ -353,7 +355,7 @@ class CoreService:
                 )
             try:
                 subprocess.run(
-                    ["python3", "-m", "venv", venv_dir],
+                    ["python3", "-m", "venv", "--without-pip", venv_dir],
                     capture_output=True, text=True, check=True, timeout=120,
                 )
                 py = os.path.join(venv_dir, "bin", "python")
@@ -424,7 +426,7 @@ class CoreService:
             # Create the per-app venv. venv creation needs only OS-dependency
             # python3-venv/ensurepip.
             subprocess.run(
-                ["python3", "-m", "venv", venv_dir],
+                ["python3", "-m", "venv", "--without-pip", venv_dir],
                 capture_output=True, text=True, check=True, timeout=120,
             )
             venv_created = True
@@ -435,10 +437,13 @@ class CoreService:
                 )
             # Install ONLY from the local wheelhouse — --no-index,
             # --find-links, no PyPI lookup, no implicit network fallback.
+            pip_cmd = [
+                sys.executable, "-m", "pip", "install", "--prefix", venv_dir,
+                "--no-index", "--no-deps", f"--find-links={wheelhouse}",
+                *[f"{name}=={version}" for name, version in sorted(declared)]
+            ]
             proc = subprocess.run(
-                [py, "-m", "pip", "install", "--no-index",
-                 "--no-deps", f"--find-links={wheelhouse}",
-                 *[f"{name}=={version}" for name, version in sorted(declared)]],
+                pip_cmd,
                 capture_output=True, text=True, timeout=300,
             )
             if proc.returncode != 0:
@@ -614,6 +619,7 @@ class CoreService:
         manifest = info["manifest"]
         version = info["active_version"]
         app_root = info["filesystem_paths"]["app_root"]
+        self.ingress.cleanup_expired(app_id)
 
         if self.worker_mode == "systemd":
             # D1c: worker as a systemd transient unit — models load INSIDE
