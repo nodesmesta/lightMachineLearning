@@ -435,6 +435,8 @@ class CoreHandler(BaseHTTPRequestHandler):
             for file_ref in consumed_file_refs:
                 service.ingress.consume(app_id, file_ref)
 
+        adapter_status = self._adapter_http_status(result_obj, batch)
+
         # H2: output validated against output_schema BEFORE the envelope
         output_schema = manifest.get("output_schema", {})
         if batch:
@@ -459,8 +461,28 @@ class CoreHandler(BaseHTTPRequestHandler):
         }
         envelope.update(result_obj)
         duration_ms = int((time.time() - started) * 1000)
-        self._audit(app_id, request_id, "ok", duration_ms, 200)
-        self._send_json(200, envelope)
+        audit_result = "ok" if adapter_status < 400 else "fail"
+        self._audit(app_id, request_id, audit_result, duration_ms, adapter_status)
+        self._send_json(adapter_status, envelope)
+
+    @staticmethod
+    def _adapter_http_status(result_obj: Dict[str, Any], batch: bool) -> int:
+        """Allow apps to return explicit controlled client-error statuses.
+
+        This keeps expected product errors out of the sanitized 500 path while
+        preserving the default 200 status for normal application results.
+        """
+        if batch:
+            return 200
+        result = result_obj.get("result")
+        if not isinstance(result, dict):
+            return 200
+        status = result.get("http_status")
+        if not isinstance(status, int):
+            return 200
+        if 400 <= status <= 499:
+            return status
+        return 200
 
     def _stream_event_base(self, app_id: str, version: str, request_id: str) -> Dict[str, Any]:
         return {"request_id": request_id, "app": app_id, "app_version": version}
