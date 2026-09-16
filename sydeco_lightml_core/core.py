@@ -439,7 +439,7 @@ class CoreService:
             # --find-links, no PyPI lookup, no implicit network fallback.
             pip_cmd = [
                 sys.executable, "-m", "pip", "install", "--prefix", venv_dir,
-                "--no-index", "--no-deps", f"--find-links={wheelhouse}",
+                "--ignore-installed", "--no-index", "--no-deps", f"--find-links={wheelhouse}",
                 *[f"{name}=={version}" for name, version in sorted(declared)]
             ]
             proc = subprocess.run(

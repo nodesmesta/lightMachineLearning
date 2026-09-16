@@ -456,6 +456,37 @@ class DepIsolationTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self._core.build_app_venv("app-x", m, root)
 
+    def test_offline_install_ignores_core_environment_packages(self) -> None:
+        """A dependency already visible to the Core/user Python must not
+        satisfy an app dependency. Core must force installation into the app
+        prefix from the app's local wheelhouse."""
+        root = os.path.join(self._tmp, "app-force-local-wheel")
+        wheelhouse = os.path.join(root, "wheelhouse")
+        os.makedirs(wheelhouse, exist_ok=True)
+        wheel = _build_ballast_wheel(self._tmp, "1.0.0")
+        shutil.copy(wheel, wheelhouse)
+        manifest = _manifest("app-force-local-wheel", "1.0.0", "1.0.0")
+        pip_commands = []
+
+        def fake_run(argv, *args, **kwargs):
+            if argv[:3] == ["python3", "-m", "venv"]:
+                os.makedirs(os.path.join(root, "venv", "bin"), exist_ok=True)
+                with open(os.path.join(root, "venv", "bin", "python"), "w", encoding="utf-8") as fh:
+                    fh.write("#!/bin/sh\n")
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            if len(argv) >= 4 and argv[1:4] == ["-m", "pip", "install"]:
+                pip_commands.append(list(argv))
+                return subprocess.CompletedProcess(argv, 0, stdout="installed", stderr="")
+            return subprocess.run(argv, *args, **kwargs)
+
+        with mock.patch("sydeco_lightml_core.core.subprocess.run", side_effect=fake_run):
+            self._core.build_app_venv("app-force-local-wheel", manifest, root)
+
+        self.assertEqual(len(pip_commands), 1)
+        self.assertIn("--ignore-installed", pip_commands[0])
+        self.assertIn("--no-index", pip_commands[0])
+        self.assertTrue(any(str(arg).startswith("--find-links=") for arg in pip_commands[0]))
+
     def test_corrupt_dependency_material_rejects(self) -> None:
         """Reviewer P5: corrupt dependency material -> REJECT (fail-closed,
         no half-valid environment left)."""
