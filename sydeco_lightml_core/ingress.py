@@ -15,6 +15,10 @@ from typing import Any, Dict, Tuple
 
 DEFAULT_INGEST_LIMIT = 5 * 1024 * 1024
 HARD_INGEST_LIMIT = 10 * 1024 * 1024
+DEFAULT_MAX_PENDING_REFS_PER_APP = 32
+DEFAULT_MAX_PENDING_BYTES_PER_APP = DEFAULT_INGEST_LIMIT * 4
+HARD_MAX_PENDING_REFS_PER_APP = 256
+HARD_MAX_PENDING_BYTES_PER_APP = HARD_INGEST_LIMIT * 32
 INGEST_TTL_SECONDS = 15 * 60
 CHUNK_SIZE = 64 * 1024
 
@@ -55,6 +59,53 @@ class IngressStore:
             limit = DEFAULT_INGEST_LIMIT
         return min(limit, HARD_INGEST_LIMIT)
 
+    @staticmethod
+    def pending_ref_limit_from_manifest(manifest: Dict[str, Any]) -> int:
+        raw = manifest.get("limits", {}).get(
+            "max_pending_refs_per_app", DEFAULT_MAX_PENDING_REFS_PER_APP
+        )
+        try:
+            limit = int(raw)
+        except (TypeError, ValueError):
+            limit = DEFAULT_MAX_PENDING_REFS_PER_APP
+        if limit < 1:
+            limit = DEFAULT_MAX_PENDING_REFS_PER_APP
+        return min(limit, HARD_MAX_PENDING_REFS_PER_APP)
+
+    @staticmethod
+    def pending_bytes_limit_from_manifest(manifest: Dict[str, Any]) -> int:
+        raw = manifest.get("limits", {}).get(
+            "max_pending_ingest_bytes_per_app", DEFAULT_MAX_PENDING_BYTES_PER_APP
+        )
+        try:
+            limit = int(raw)
+        except (TypeError, ValueError):
+            limit = DEFAULT_MAX_PENDING_BYTES_PER_APP
+        if limit < 1:
+            limit = DEFAULT_MAX_PENDING_BYTES_PER_APP
+        return min(limit, HARD_MAX_PENDING_BYTES_PER_APP)
+
+    def pending_usage(self, app_id: str) -> Dict[str, int]:
+        root = self._app_root(app_id)
+        usage = {"pending_refs": 0, "pending_bytes": 0}
+        if not os.path.isdir(root):
+            return usage
+        for name in os.listdir(root):
+            path = os.path.join(root, name)
+            meta = os.path.join(path, "metadata.json")
+            if not os.path.isdir(path) or not os.path.isfile(meta):
+                continue
+            try:
+                with open(meta, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                if data.get("app_id") != app_id:
+                    continue
+                usage["pending_refs"] += 1
+                usage["pending_bytes"] += max(0, int(data.get("size_bytes", 0)))
+            except Exception:
+                continue
+        return usage
+
     def cleanup_expired(self, app_id: str, now: float | None = None) -> None:
         now = time.time() if now is None else now
         root = self._app_root(app_id)
@@ -88,6 +139,13 @@ class IngressStore:
         if content_length > limit:
             raise IngestError(413, "file exceeds upload size limit")
         self.cleanup_expired(app_id)
+        usage = self.pending_usage(app_id)
+        ref_limit = self.pending_ref_limit_from_manifest(manifest)
+        byte_limit = self.pending_bytes_limit_from_manifest(manifest)
+        if usage["pending_refs"] >= ref_limit:
+            raise IngestError(429, "pending file reference limit exceeded")
+        if usage["pending_bytes"] + content_length > byte_limit:
+            raise IngestError(413, "pending ingress byte limit exceeded")
         root = self._app_root(app_id)
         os.makedirs(root, exist_ok=True)
         file_ref = secrets.token_urlsafe(24)
@@ -147,6 +205,56 @@ class IngressStore:
             raise IngestError(404, "file reference not found")
         return {
             "ref": file_ref,
+            "path": payload,
+            "filename": meta.get("filename", "upload.bin"),
+            "content_type": meta.get("content_type", "application/octet-stream"),
+            "size_bytes": int(meta.get("size_bytes", 0)),
+            "expires_at_epoch": int(meta.get("expires_at_epoch", 0)),
+        }
+
+    def claim(self, app_id: str, file_ref: str) -> Dict[str, Any]:
+        """Atomically claim a one-shot file reference.
+
+        A successful claim renames the available reference directory before
+        returning the payload path, so simultaneous consumers cannot both
+        resolve the same reference. The returned ``claim_ref`` must be passed
+        to ``consume()`` for deterministic cleanup after the request path exits.
+        """
+        if not isinstance(file_ref, str) or not file_ref:
+            raise IngestError(400, "invalid file reference")
+        ref_dir = self._safe_dir(app_id, file_ref)
+        claim_ref = file_ref + ".claimed-" + secrets.token_urlsafe(8)
+        claim_dir = self._safe_dir(app_id, claim_ref)
+        try:
+            os.rename(ref_dir, claim_dir)
+        except FileNotFoundError:
+            raise IngestError(404, "file reference not found")
+        except OSError:
+            raise IngestError(404, "file reference not found")
+
+        meta_path = os.path.join(claim_dir, "metadata.json")
+        try:
+            with open(meta_path, "r", encoding="utf-8") as fh:
+                meta = json.load(fh)
+        except Exception:
+            shutil.rmtree(claim_dir, ignore_errors=True)
+            raise IngestError(404, "file reference not found")
+        if meta.get("app_id") != app_id:
+            shutil.rmtree(claim_dir, ignore_errors=True)
+            raise IngestError(404, "file reference not found")
+        if float(meta.get("expires_at_epoch", 0)) <= time.time():
+            shutil.rmtree(claim_dir, ignore_errors=True)
+            raise IngestError(404, "file reference expired")
+        payload = os.path.realpath(os.path.abspath(os.path.join(claim_dir, "payload.bin")))
+        if os.path.commonpath([claim_dir, payload]) != claim_dir:
+            shutil.rmtree(claim_dir, ignore_errors=True)
+            raise IngestError(400, "invalid file reference")
+        if not os.path.isfile(payload):
+            shutil.rmtree(claim_dir, ignore_errors=True)
+            raise IngestError(404, "file reference not found")
+        return {
+            "ref": file_ref,
+            "claim_ref": claim_ref,
             "path": payload,
             "filename": meta.get("filename", "upload.bin"),
             "content_type": meta.get("content_type", "application/octet-stream"),

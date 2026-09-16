@@ -354,13 +354,13 @@ class CoreHandler(BaseHTTPRequestHandler):
             })
             return
 
-        consumed_file_refs: List[str] = []
+        claimed_file_refs: List[str] = []
         resolved_items: List[Dict[str, Any]] = []
         for item in items:
             prepared = dict(item)
             if "file_ref" in prepared:
                 try:
-                    file_obj = service.ingress.resolve(app_id, prepared["file_ref"])
+                    file_obj = service.ingress.claim(app_id, prepared["file_ref"])
                 except IngestError as exc:
                     self._audit(app_id, request_id, "fail", 0, exc.status, exc.message)
                     self._send_json(exc.status, {
@@ -369,70 +369,73 @@ class CoreHandler(BaseHTTPRequestHandler):
                     })
                     return
                 prepared["file"] = file_obj
-                consumed_file_refs.append(str(prepared["file_ref"]))
+                claimed_file_refs.append(str(file_obj.get("claim_ref", prepared["file_ref"])))
             resolved_items.append(prepared)
         items = resolved_items
 
-        # G2/G3 readiness gate (target app only)
-        ok, status = self._ready_or_wait(app_id)
-        if not ok:
-            self._audit(app_id, request_id, "fail", 0, 503, f"not ready ({status})")
-            self._send_json(503, {
-                "error": {"code": "503", "message": f"app not ready: {app_id}"},
-                "request_id": request_id,
-            })
-            return
-
-        wants_stream = "application/x-ndjson" in self.headers.get("Accept", "")
-        if wants_stream:
-            if batch:
-                self._audit(app_id, request_id, "fail", 0, 400, "streaming batch unsupported")
-                self._send_json(400, {
-                    "error": {
-                        "code": "400",
-                        "message": "streaming batch requests are not supported",
-                    },
+        try:
+            # G2/G3 readiness gate (target app only). This is inside the
+            # claim cleanup scope: once a file_ref is claimed, every following
+            # path consumes it, including readiness failures.
+            ok, status = self._ready_or_wait(app_id)
+            if not ok:
+                self._audit(app_id, request_id, "fail", 0, 503, f"not ready ({status})")
+                self._send_json(503, {
+                    "error": {"code": "503", "message": f"app not ready: {app_id}"},
                     "request_id": request_id,
                 })
                 return
-            self._handle_stream_infer(app_id, version, request_id, started, items[0])
-            return
 
-        # run (single-flight M3, timeout M4)
-        host = service.worker_host(app_id)
-        try:
-            if batch:
-                results: List[Any] = []
-                for item in items:
-                    results.append(host.infer(item, request_id))
-                result_obj = {"results": results}
-            else:
-                result_obj = {"result": host.infer(items[0], request_id)}
-        except InferenceTimeout:
-            self._audit(app_id, request_id, "fail", 0, 504, "inference timeout")
-            self._send_json(504, {
-                "error": {"code": "504", "message": "inference timeout"},
-                "request_id": request_id,
-            })
-            return
-        except WorkerNotReady:
-            self._audit(app_id, request_id, "fail", 0, 503, "worker not ready")
-            self._send_json(503, {
-                "error": {"code": "503", "message": f"app not ready: {app_id}"},
-                "request_id": request_id,
-            })
-            return
-        except Exception as exc:
-            # H2/sanitized: no internal detail reaches the client
-            log.exception("infer failed for %s", app_id)
-            self._audit(app_id, request_id, "fail", 0, 500, f"infer exception: {type(exc).__name__}")
-            self._send_json(500, {
-                "error": {"code": "500", "message": "internal error"},
-                "request_id": request_id,
-            })
-            return
+            wants_stream = "application/x-ndjson" in self.headers.get("Accept", "")
+            if wants_stream:
+                if batch:
+                    self._audit(app_id, request_id, "fail", 0, 400, "streaming batch unsupported")
+                    self._send_json(400, {
+                        "error": {
+                            "code": "400",
+                            "message": "streaming batch requests are not supported",
+                        },
+                        "request_id": request_id,
+                    })
+                    return
+                self._handle_stream_infer(app_id, version, request_id, started, items[0])
+                return
+
+            # run (single-flight M3, timeout M4)
+            host = service.worker_host(app_id)
+            try:
+                if batch:
+                    results: List[Any] = []
+                    for item in items:
+                        results.append(host.infer(item, request_id))
+                    result_obj = {"results": results}
+                else:
+                    result_obj = {"result": host.infer(items[0], request_id)}
+            except InferenceTimeout:
+                self._audit(app_id, request_id, "fail", 0, 504, "inference timeout")
+                self._send_json(504, {
+                    "error": {"code": "504", "message": "inference timeout"},
+                    "request_id": request_id,
+                })
+                return
+            except WorkerNotReady:
+                self._audit(app_id, request_id, "fail", 0, 503, "worker not ready")
+                self._send_json(503, {
+                    "error": {"code": "503", "message": f"app not ready: {app_id}"},
+                    "request_id": request_id,
+                })
+                return
+            except Exception as exc:
+                # H2/sanitized: no internal detail reaches the client
+                log.exception("infer failed for %s", app_id)
+                self._audit(app_id, request_id, "fail", 0, 500, f"infer exception: {type(exc).__name__}")
+                self._send_json(500, {
+                    "error": {"code": "500", "message": "internal error"},
+                    "request_id": request_id,
+                })
+                return
         finally:
-            for file_ref in consumed_file_refs:
+            for file_ref in claimed_file_refs:
                 service.ingress.consume(app_id, file_ref)
 
         adapter_status = self._adapter_http_status(result_obj, batch)
