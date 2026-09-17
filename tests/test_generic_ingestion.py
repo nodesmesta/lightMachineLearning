@@ -325,6 +325,38 @@ class GenericIngestionTests(unittest.TestCase):
         status, body = self.http.ingest("ingest-app", b"c", token)
         self.assertEqual(status, 200, body)
 
+    def test_pending_reference_count_quota_is_atomic_for_concurrent_uploads(self) -> None:
+        _app_dir, token = self._bundle(
+            limits_extra={"max_pending_refs_per_app": 1, "max_pending_ingest_bytes_per_app": 1024}
+        )
+        self._start_once()
+        barrier = threading.Barrier(3)
+        results = []
+        lock = threading.Lock()
+
+        def upload_once(payload: bytes) -> None:
+            barrier.wait(timeout=10)
+            result = self.http.ingest("ingest-app", payload, token)
+            with lock:
+                results.append(result)
+
+        threads = [
+            threading.Thread(target=upload_once, args=(b"concurrent-a",)),
+            threading.Thread(target=upload_once, args=(b"concurrent-b",)),
+        ]
+        for thread in threads:
+            thread.start()
+        barrier.wait(timeout=10)
+        for thread in threads:
+            thread.join(timeout=10)
+
+        self.assertEqual(len(results), 2)
+        statuses = sorted(status for status, _body in results)
+        self.assertEqual(statuses, [200, 429], results)
+        usage = self.service.ingress.pending_usage("ingest-app")
+        self.assertEqual(usage["pending_refs"], 1)
+        self.assertIn(usage["pending_bytes"], {len(b"concurrent-a"), len(b"concurrent-b")})
+
     def test_pending_byte_quota_rejects_without_partial_file(self) -> None:
         _app_dir, token = self._bundle(
             limits_extra={"max_pending_refs_per_app": 10, "max_pending_ingest_bytes_per_app": 10}

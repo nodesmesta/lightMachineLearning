@@ -10,6 +10,7 @@ import json
 import os
 import secrets
 import shutil
+import threading
 import time
 from typing import Any, Dict, Tuple
 
@@ -37,6 +38,16 @@ class IngressStore:
 
     def __init__(self, data_dir: str) -> None:
         self.data_dir = os.path.realpath(os.path.abspath(data_dir))
+        self._locks_guard = threading.Lock()
+        self._app_locks: Dict[str, threading.RLock] = {}
+
+    def _app_lock(self, app_id: str) -> threading.RLock:
+        with self._locks_guard:
+            lock = self._app_locks.get(app_id)
+            if lock is None:
+                lock = threading.RLock()
+                self._app_locks[app_id] = lock
+            return lock
 
     def _app_root(self, app_id: str) -> str:
         return os.path.join(self.data_dir, "apps", app_id, "ingress")
@@ -86,6 +97,10 @@ class IngressStore:
         return min(limit, HARD_MAX_PENDING_BYTES_PER_APP)
 
     def pending_usage(self, app_id: str) -> Dict[str, int]:
+        with self._app_lock(app_id):
+            return self._pending_usage_unlocked(app_id)
+
+    def _pending_usage_unlocked(self, app_id: str) -> Dict[str, int]:
         root = self._app_root(app_id)
         usage = {"pending_refs": 0, "pending_bytes": 0}
         if not os.path.isdir(root):
@@ -107,6 +122,10 @@ class IngressStore:
         return usage
 
     def cleanup_expired(self, app_id: str, now: float | None = None) -> None:
+        with self._app_lock(app_id):
+            self._cleanup_expired_unlocked(app_id, now)
+
+    def _cleanup_expired_unlocked(self, app_id: str, now: float | None = None) -> None:
         now = time.time() if now is None else now
         root = self._app_root(app_id)
         if not os.path.isdir(root):
@@ -138,48 +157,49 @@ class IngressStore:
         limit = self.limit_from_manifest(manifest)
         if content_length > limit:
             raise IngestError(413, "file exceeds upload size limit")
-        self.cleanup_expired(app_id)
-        usage = self.pending_usage(app_id)
-        ref_limit = self.pending_ref_limit_from_manifest(manifest)
-        byte_limit = self.pending_bytes_limit_from_manifest(manifest)
-        if usage["pending_refs"] >= ref_limit:
-            raise IngestError(429, "pending file reference limit exceeded")
-        if usage["pending_bytes"] + content_length > byte_limit:
-            raise IngestError(413, "pending ingress byte limit exceeded")
-        root = self._app_root(app_id)
-        os.makedirs(root, exist_ok=True)
-        file_ref = secrets.token_urlsafe(24)
-        ref_dir = self._safe_dir(app_id, file_ref)
-        os.makedirs(ref_dir, mode=0o700, exist_ok=False)
-        payload_path = os.path.join(ref_dir, "payload.bin")
-        remaining = content_length
-        written = 0
-        try:
-            with open(payload_path, "wb") as out:
-                while remaining > 0:
-                    chunk = rfile.read(min(CHUNK_SIZE, remaining))
-                    if not chunk:
-                        raise IngestError(400, "incomplete upload body")
-                    out.write(chunk)
-                    written += len(chunk)
-                    remaining -= len(chunk)
-            expires = int(time.time() + INGEST_TTL_SECONDS)
-            meta = {
-                "app_id": app_id,
-                "file_ref": file_ref,
-                "filename": os.path.basename(filename or "upload.bin"),
-                "content_type": content_type or "application/octet-stream",
-                "size_bytes": written,
-                "path": payload_path,
-                "expires_at_epoch": expires,
-                "created_at_epoch": int(time.time()),
-            }
-            with open(os.path.join(ref_dir, "metadata.json"), "w", encoding="utf-8") as fh:
-                json.dump(meta, fh, indent=2, sort_keys=True)
-            return dict(meta)
-        except Exception:
-            shutil.rmtree(ref_dir, ignore_errors=True)
-            raise
+        with self._app_lock(app_id):
+            self._cleanup_expired_unlocked(app_id)
+            usage = self._pending_usage_unlocked(app_id)
+            ref_limit = self.pending_ref_limit_from_manifest(manifest)
+            byte_limit = self.pending_bytes_limit_from_manifest(manifest)
+            if usage["pending_refs"] >= ref_limit:
+                raise IngestError(429, "pending file reference limit exceeded")
+            if usage["pending_bytes"] + content_length > byte_limit:
+                raise IngestError(413, "pending ingress byte limit exceeded")
+            root = self._app_root(app_id)
+            os.makedirs(root, exist_ok=True)
+            file_ref = secrets.token_urlsafe(24)
+            ref_dir = self._safe_dir(app_id, file_ref)
+            os.makedirs(ref_dir, mode=0o700, exist_ok=False)
+            payload_path = os.path.join(ref_dir, "payload.bin")
+            remaining = content_length
+            written = 0
+            try:
+                with open(payload_path, "wb") as out:
+                    while remaining > 0:
+                        chunk = rfile.read(min(CHUNK_SIZE, remaining))
+                        if not chunk:
+                            raise IngestError(400, "incomplete upload body")
+                        out.write(chunk)
+                        written += len(chunk)
+                        remaining -= len(chunk)
+                expires = int(time.time() + INGEST_TTL_SECONDS)
+                meta = {
+                    "app_id": app_id,
+                    "file_ref": file_ref,
+                    "filename": os.path.basename(filename or "upload.bin"),
+                    "content_type": content_type or "application/octet-stream",
+                    "size_bytes": written,
+                    "path": payload_path,
+                    "expires_at_epoch": expires,
+                    "created_at_epoch": int(time.time()),
+                }
+                with open(os.path.join(ref_dir, "metadata.json"), "w", encoding="utf-8") as fh:
+                    json.dump(meta, fh, indent=2, sort_keys=True)
+                return dict(meta)
+            except Exception:
+                shutil.rmtree(ref_dir, ignore_errors=True)
+                raise
 
     def resolve(self, app_id: str, file_ref: str) -> Dict[str, Any]:
         if not isinstance(file_ref, str) or not file_ref:
