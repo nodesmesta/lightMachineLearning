@@ -24,6 +24,7 @@ import os
 import secrets
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -425,6 +426,63 @@ class DepIsolationTests(unittest.TestCase):
         self.assertIn("venv", message.lower())
         start_mock.assert_not_called()
 
+    def test_dependency_install_requires_explicit_pip_os_prerequisite(self) -> None:
+        """Reviewer 18-09 P3: a dependency-bearing app must fail at preflight
+        with a clear OS-prerequisite message when the Core Python has no pip."""
+        root = os.path.join(self._tmp, "app-needs-pip")
+        wheelhouse = os.path.join(root, "wheelhouse")
+        os.makedirs(wheelhouse, exist_ok=True)
+        wheel = _build_ballast_wheel(self._tmp, "1.0.0")
+        shutil.copy(wheel, wheelhouse)
+        manifest = _manifest("app-needs-pip", "1.0.0", "1.0.0")
+
+        real_run = subprocess.run
+
+        def fake_run(argv, *args, **kwargs):
+            if argv[:3] == ["python3", "-m", "venv"]:
+                os.makedirs(os.path.join(root, "venv", "bin"), exist_ok=True)
+                with open(os.path.join(root, "venv", "bin", "python"), "w", encoding="utf-8") as fh:
+                    fh.write("#!/bin/sh\n")
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            if len(argv) >= 3 and argv[1:3] == ["-m", "pip"]:
+                return subprocess.CompletedProcess(
+                    argv, 1, stdout="", stderr="No module named pip"
+                )
+            return real_run(argv, *args, **kwargs)
+
+        with mock.patch("sydeco_lightml_core.core.subprocess.run", side_effect=fake_run):
+            with self.assertRaisesRegex(RuntimeError, "OS prerequisite.*python3-pip"):
+                self._core.build_app_venv("app-needs-pip", manifest, root)
+
+    def test_systemd_accepts_standard_venv_python_symlink_to_trusted_os_python(self) -> None:
+        """Reviewer 18-09 P3: systemd worker mode must accept the normal
+        venv/bin/python symlink shape while still launching the venv path."""
+        service = CoreService(
+            data_dir=os.path.join(self._tmp, "core-data-systemd-symlink"),
+            worker_mode="systemd",
+        )
+        app_root = os.path.join(self._tmp, "app-systemd-symlink")
+        venv_dir = os.path.join(app_root, "venv")
+        bin_dir = os.path.join(venv_dir, "bin")
+        os.makedirs(bin_dir, exist_ok=True)
+        app_python = os.path.join(bin_dir, "python")
+        os.symlink(sys.executable, app_python)
+        fake_manifest = _manifest("app-systemd-symlink", "1.0.0", "1.0.0")
+
+        with mock.patch("sydeco_lightml_core.core.subprocess.run") as run_mock, \
+             mock.patch.object(service.worker_manager, "start") as start_mock:
+            run_mock.return_value = subprocess.CompletedProcess(args=["chown"], returncode=0)
+            ok, message, _ = service._start_app_systemd(
+                "app-systemd-symlink", fake_manifest, "1.0.0", app_root, venv_dir
+            )
+
+        self.assertTrue(ok, message)
+        start_mock.assert_called_once()
+        context = start_mock.call_args.args[3]
+        self.assertEqual(context["python"], app_python)
+        self.assertEqual(context["cwd"], context["data_dir"])
+        self.assertNotEqual(context["cwd"], os.environ.get("SYDECO_LIGHTML_WORKER_REPO"))
+
     def test_shell_injection_dependency_name_is_safe(self) -> None:
         """Reviewer 01-09 P5: the hostile dependency marker checked by the test
         must exactly match the path the hostile string attempts to create."""
@@ -474,6 +532,8 @@ class DepIsolationTests(unittest.TestCase):
                 with open(os.path.join(root, "venv", "bin", "python"), "w", encoding="utf-8") as fh:
                     fh.write("#!/bin/sh\n")
                 return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            if len(argv) >= 4 and argv[1:4] == ["-m", "pip", "--version"]:
+                return subprocess.CompletedProcess(argv, 0, stdout="pip 22", stderr="")
             if len(argv) >= 4 and argv[1:4] == ["-m", "pip", "install"]:
                 pip_commands.append(list(argv))
                 return subprocess.CompletedProcess(argv, 0, stdout="installed", stderr="")

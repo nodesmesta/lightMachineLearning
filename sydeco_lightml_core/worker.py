@@ -804,7 +804,10 @@ class SystemdTransientWorkerHost(WorkerHost):
         if self._launch_count == 0:
             unit = f"{self._unit_prefix}-{app_id}"
         else:
-            unit = f"{self._unit_prefix}-{app_id}-r{self._launch_count}"
+            unit = (
+                f"{self._unit_prefix}-{app_id}-r{self._launch_count}-"
+                f"{secrets.token_hex(4)}"
+            )
         self._launch_count += 1
         self._unit = unit
         self._last_context = dict(context)
@@ -951,6 +954,10 @@ class SystemdTransientWorkerHost(WorkerHost):
                 ["systemctl", "kill", "-s", "SIGKILL", unit],
                 capture_output=True, text=True, timeout=30,
             )
+        subprocess.run(
+            ["systemctl", "reset-failed", unit],
+            capture_output=True, text=True, timeout=30,
+        )
         self._started = False
         self._ready = False
         if self._readiness is not None:

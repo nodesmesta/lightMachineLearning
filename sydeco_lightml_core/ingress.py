@@ -24,6 +24,33 @@ INGEST_TTL_SECONDS = 15 * 60
 CHUNK_SIZE = 64 * 1024
 
 
+def _rmtree_force(path: str) -> None:
+    for root, dirs, files in os.walk(path):
+        try:
+            os.chmod(root, 0o700)
+        except OSError:
+            pass
+        for name in dirs:
+            try:
+                os.chmod(os.path.join(root, name), 0o700)
+            except OSError:
+                pass
+        for name in files:
+            try:
+                os.chmod(os.path.join(root, name), 0o600)
+            except OSError:
+                pass
+
+    def _make_writable(func: Any, failed_path: str, _exc_info: Any) -> None:
+        try:
+            os.chmod(failed_path, 0o700)
+            func(failed_path)
+        except Exception:
+            pass
+
+    shutil.rmtree(path, ignore_errors=False, onerror=_make_writable)
+
+
 class IngestError(Exception):
     """Controlled ingest/reference error."""
 
@@ -272,6 +299,13 @@ class IngressStore:
         if not os.path.isfile(payload):
             shutil.rmtree(claim_dir, ignore_errors=True)
             raise IngestError(404, "file reference not found")
+        # Production systemd workers run as a dedicated capability user. Core
+        # owns the one-shot reference lifecycle, but after claim the worker must
+        # be able to traverse the claimed directory and read the payload path
+        # passed in the generic request. The path remains unguessable,
+        # app-scoped, and is consumed in the server finally block.
+        os.chmod(claim_dir, 0o555)
+        os.chmod(payload, 0o444)
         return {
             "ref": file_ref,
             "claim_ref": claim_ref,
@@ -284,6 +318,10 @@ class IngressStore:
 
     def consume(self, app_id: str, file_ref: str) -> None:
         try:
-            shutil.rmtree(self._safe_dir(app_id, file_ref), ignore_errors=True)
+            path = self._safe_dir(app_id, file_ref)
+            if os.path.exists(path):
+                _rmtree_force(path)
         except IngestError:
+            return
+        except OSError:
             return

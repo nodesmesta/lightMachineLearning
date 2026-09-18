@@ -56,6 +56,84 @@ def _resolve_within_app_root(app_root: str, *parts: str, label: str) -> str:
     return path
 
 
+def _run_preflight(command: List[str], prerequisite: str, purpose: str) -> None:
+    """Fail early with reviewer-facing OS-prerequisite wording.
+
+    LightML app dependencies remain offline/local wheelhouse dependencies; this
+    check only validates host OS tools required to build or launch that isolated
+    runtime.
+    """
+    try:
+        proc = subprocess.run(
+            command, capture_output=True, text=True, timeout=30
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"install rejected: missing OS prerequisite {prerequisite}: "
+            f"{purpose}: {exc}"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"install rejected: OS prerequisite {prerequisite} preflight timed out: "
+            f"{purpose}"
+        ) from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(
+            f"install rejected: missing OS prerequisite {prerequisite}: "
+            f"{purpose}: {detail}"
+        )
+
+
+def _trusted_os_python_targets() -> set[str]:
+    """Return trusted OS/Core Python realpaths accepted as venv symlink targets."""
+    candidates = {sys.executable}
+    for name in ("python3", "python"):
+        found = shutil.which(name)
+        if found:
+            candidates.add(found)
+    trusted = set()
+    for candidate in candidates:
+        try:
+            trusted.add(os.path.realpath(os.path.abspath(candidate)))
+        except OSError:
+            pass
+    return trusted
+
+
+def _validate_app_venv_python(app_root: str, venv: str) -> str:
+    """Validate and return the app-owned venv interpreter path.
+
+    Standard Python venvs often keep ``venv/bin/python`` inside the app root as
+    a symlink to the trusted OS Python binary. The app-owned path is the launch
+    boundary; the symlink target may be the trusted OS interpreter, but arbitrary
+    outside-app targets remain rejected.
+    """
+    root = os.path.realpath(os.path.abspath(app_root))
+    venv_real = _resolve_within_app_root(
+        root, os.path.relpath(venv, root), label="venv path"
+    )
+    candidate_path = os.path.abspath(
+        os.path.normpath(os.path.join(venv_real, "bin", "python"))
+    )
+    if os.path.commonpath([root, candidate_path]) != root:
+        raise RuntimeError(
+            f"start rejected: venv interpreter path escapes app root: {candidate_path}"
+        )
+    if not os.path.isfile(candidate_path):
+        raise RuntimeError(
+            f"start rejected: venv interpreter missing: {candidate_path}"
+        )
+    target = os.path.realpath(candidate_path)
+    if os.path.commonpath([root, target]) == root:
+        return candidate_path
+    if target in _trusted_os_python_targets():
+        return candidate_path
+    raise RuntimeError(
+        f"start rejected: venv interpreter target is not trusted OS Python: {target}"
+    )
+
+
 class CoreService:
     """Universal LightML Core facade (Day 1 scope)."""
 
@@ -354,6 +432,11 @@ class CoreService:
                     f"dependency-free app {app_id}"
                 )
             try:
+                _run_preflight(
+                    ["python3", "-m", "venv", "--help"],
+                    "python3-venv",
+                    "required to create the per-app venv",
+                )
                 subprocess.run(
                     ["python3", "-m", "venv", "--without-pip", venv_dir],
                     capture_output=True, text=True, check=True, timeout=120,
@@ -405,6 +488,16 @@ class CoreService:
         # must leave NO half-valid environment (reviewer P5).
         venv_created = False
         try:
+            _run_preflight(
+                ["python3", "-m", "venv", "--help"],
+                "python3-venv",
+                "required to create the per-app venv",
+            )
+            _run_preflight(
+                [sys.executable, "-m", "pip", "--version"],
+                "python3-pip",
+                "required to install app dependencies from the local wheelhouse",
+            )
             # Verify dependency material integrity up front (existing
             # trust/integrity architecture, J2/J4): a corrupted/mis-named wheel
             # is REJECTED here, before any venv is built.
@@ -518,6 +611,11 @@ class CoreService:
         os.makedirs(app_data_dir, exist_ok=True)
         os.chmod(app_data_dir, 0o755)
         if self.worker_mode == "systemd":
+            if shutil.which("systemd-run") is None:
+                return False, (
+                    "start rejected: missing OS prerequisite systemd: "
+                    "systemd-run is required for production worker mode"
+                ), None
             try:
                 subprocess.run(
                     ["chown", "-R", f"sydeco-cap-{app_id}:sydeco-cap-{app_id}",
@@ -537,16 +635,11 @@ class CoreService:
         if not venv:
             return False, f"start rejected: app {app_id} has no dedicated venv", None
         try:
-            venv = _resolve_within_app_root(app_root, os.path.relpath(venv, app_root), label="venv path")
+            app_python = _validate_app_venv_python(app_root, venv)
+        except RuntimeError as exc:
+            return False, str(exc), None
         except ValueError:
             return False, f"start rejected: venv path escapes app root: {venv}", None
-        candidate = _resolve_within_app_root(
-            app_root, os.path.relpath(os.path.join(venv, "bin", "python"), app_root),
-            label="venv interpreter",
-        )
-        if not os.path.isfile(candidate):
-            return False, f"start rejected: venv interpreter missing: {candidate}", None
-        app_python = candidate
         context: Dict[str, Any] = {
             "app_root": app_root,
             "config": manifest,
@@ -554,7 +647,10 @@ class CoreService:
             "port": allocate_port(),            # D2 req 1: Core assigns
             "user": f"sydeco-cap-{app_id}",     # D3a
             "python": app_python,               # J1/J2: per-app interpreter
-            "cwd": repo_root,
+            # Issue 2 (reviewer 18-09): WorkingDirectory must be accessible by the
+            # capability user. app_data_dir is created and chowned to that user,
+            # so it is the correct working directory — not the repo root.
+            "cwd": app_data_dir,
             "pythonpath": repo_root,
             # Day 2 (P3): Core secrets area for the ephemeral LoadCredential
             # file (root-only 0600, per launch, removed on stop — D5 #4).

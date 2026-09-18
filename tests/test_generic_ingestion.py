@@ -189,6 +189,26 @@ class GenericIngestionTests(unittest.TestCase):
             )
             self.assertEqual(status, 404, body)
 
+    def test_claimed_file_ref_is_readable_by_systemd_worker_user(self) -> None:
+        """Reviewer 18-09 P3: after Core claims a file_ref for a production
+        worker, the app worker user must be able to traverse/read the payload."""
+        _app_dir, token = self._bundle()
+        self._start_once()
+        status, body = self.http.ingest(
+            "ingest-app", b"systemd readable", token,
+            filename="systemd-readable.txt", content_type="text/plain",
+        )
+        self.assertEqual(status, 200, body)
+        claim = self.service.ingress.claim("ingest-app", body["upload"]["file_ref"])
+        try:
+            claim_dir = os.path.dirname(claim["path"])
+            self.assertTrue(os.stat(claim_dir).st_mode & 0o005)
+            self.assertTrue(os.stat(claim["path"]).st_mode & 0o004)
+            with open(claim["path"], "rb") as fh:
+                self.assertEqual(fh.read(), b"systemd readable")
+        finally:
+            self.service.ingress.consume("ingest-app", claim["claim_ref"])
+
     def test_existing_json_inference_still_works(self) -> None:
         _app_dir, token = self._bundle()
         self._start_once()
