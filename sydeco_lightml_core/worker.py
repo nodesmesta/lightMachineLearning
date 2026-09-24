@@ -26,7 +26,7 @@ from typing import Any, Callable, Dict, Optional, Union
 
 from .adapter import Adapter
 from .health import AppStatus, ReadinessStore
-from .network_policy import adapter_network_guard
+from .network_policy import NETWORK_NONE, adapter_network_guard, network_policy_from_config
 
 
 class WorkerHost(abc.ABC):
@@ -863,12 +863,22 @@ class SystemdTransientWorkerHost(WorkerHost):
             "ProtectSystem=strict",
             "PrivateTmp=yes",
             "NoNewPrivileges=yes",
-            "RestrictAddressFamilies=AF_INET",
+            "RestrictAddressFamilies=AF_INET AF_INET6",
             "Restart=on-failure",
             "StartLimitBurst=3",
             "StartLimitIntervalSec=10",
             f"TimeoutStopSec={int(self._grace_seconds)}",  # seconds (249 shows '30s')
         ]
+        if network_policy_from_config(manifest) == NETWORK_NONE:
+            # P2 RC2 production boundary: the Python socket guard remains
+            # defence-in-depth, but the systemd worker also gets cgroup/kernel
+            # IP filtering. Loopback stays open for Core <-> worker health,
+            # infer, and stream traffic; all non-loopback IPv4/IPv6 is denied.
+            props += [
+                "IPAddressDeny=any",
+                "IPAddressAllow=127.0.0.0/8",
+                "IPAddressAllow=::1/128",
+            ]
         if data_dir:
             # R7a / L4: the app's OWN data dir is the ONLY writable path
             # under ProtectSystem=strict (production pattern 3.3).

@@ -9,9 +9,13 @@ import shutil
 import socket
 import tempfile
 import threading
+import time
+import types
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from sydeco_lightml_core.core import CoreService
+from sydeco_lightml_core.worker import SystemdTransientWorkerHost
 from sydeco_lightml_core.validation import validate_manifest
 
 from tests._http_harness import HttpHarness
@@ -202,6 +206,91 @@ class NetworkPermissionTests(unittest.TestCase):
             listener.close()
             thread.join(timeout=2)
         self.assertEqual(accepted, [True])
+
+    def _systemd_props_for_network_policy(self, network: str) -> list[str]:
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):  # noqa: A002
+                pass
+
+            def do_GET(self):  # noqa: N802
+                body = b'{"status":"ready"}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+        calls: list[list[str]] = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            if argv and argv[0] == "systemd-run":
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+            if argv and argv[0] == "systemctl":
+                if len(argv) > 1 and argv[1] == "show":
+                    if "--value" in argv:
+                        return types.SimpleNamespace(returncode=0, stdout="inactive\n", stderr="")
+                    return types.SimpleNamespace(
+                        returncode=0,
+                        stdout="ActiveState=active\nResult=\nNRestarts=0\n",
+                        stderr="",
+                    )
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        import subprocess as _subprocess
+
+        original_run = _subprocess.run
+        _subprocess.run = fake_run
+        try:
+            host = SystemdTransientWorkerHost(ready_wait=2.0, poll_interval=0.05)
+            self.addCleanup(host.shutdown)
+            host.start(
+                "network-test",
+                "1.0.0",
+                None,
+                {
+                    "app_root": self._tmp,
+                    "config": {
+                        "permissions": {"network": network},
+                        "resource_limits": {"inference_timeout": 1.0},
+                    },
+                    "data_dir": os.path.join(self._tmp, "data"),
+                    "port": httpd.server_address[1],
+                    "user": "",
+                    "cwd": "",
+                    "pythonpath": "",
+                    "credential_dir": os.path.join(self._tmp, "secrets"),
+                },
+            )
+            deadline = time.time() + 2.0
+            while time.time() < deadline and not calls:
+                time.sleep(0.01)
+            systemd_calls = [call for call in calls if call and call[0] == "systemd-run"]
+            self.assertEqual(len(systemd_calls), 1, calls)
+            return [arg.removeprefix("--property=") for arg in systemd_calls[0]
+                    if arg.startswith("--property=")]
+        finally:
+            _subprocess.run = original_run
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_systemd_network_none_uses_os_ip_filtering(self) -> None:
+        props = self._systemd_props_for_network_policy("none")
+
+        self.assertIn("IPAddressDeny=any", props)
+        self.assertIn("IPAddressAllow=127.0.0.0/8", props)
+        self.assertIn("IPAddressAllow=::1/128", props)
+        self.assertIn("RestrictAddressFamilies=AF_INET AF_INET6", props)
+
+    def test_systemd_outbound_network_omits_deny_filter(self) -> None:
+        props = self._systemd_props_for_network_policy("outbound")
+
+        self.assertNotIn("IPAddressDeny=any", props)
+        self.assertIn("RestrictAddressFamilies=AF_INET AF_INET6", props)
 
 
 if __name__ == "__main__":

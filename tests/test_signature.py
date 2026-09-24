@@ -20,10 +20,11 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 from sydeco_lightml_core.core import CoreService
 
-from tests._signing import sign_manifest
+from tests._signing import _enable_test_trust, sign_manifest
 
 ADAPTER_CODE = (
     "class Adapter:\n"
@@ -95,6 +96,7 @@ def _make_bundle(tmp: str, app_id: str = "sig-test-app") -> str:
 
 class TestBundleSecurity(unittest.TestCase):
     def setUp(self) -> None:
+        os.environ.pop("SYDECO_LIGHTML_TRUSTED_KEYS_FILE", None)
         self._tmp = tempfile.mkdtemp(prefix="sydeco-sig-")
         self.data_dir = os.path.join(self._tmp, "data")
         self.service = CoreService(data_dir=self.data_dir)
@@ -119,6 +121,7 @@ class TestBundleSecurity(unittest.TestCase):
     # 2. unsigned bundle -> rejected
     def test_02_unsigned_rejected(self) -> None:
         bundle = _make_bundle(self._tmp)
+        _enable_test_trust(bundle)
         ok, message, _ = self._install(bundle)
         self.assertFalse(ok, "unsigned bundle must be rejected (R6)")
         self.assertIn("unsigned bundle", message.lower())
@@ -164,6 +167,7 @@ class TestBundleSecurity(unittest.TestCase):
                     encryption_algorithm=serialization.NoEncryption(),
                 )
             )
+        sign_manifest(bundle)
         sign_manifest(bundle, key_path=other_path)
         ok, message, _ = self._install(bundle)
         self.assertFalse(ok, "bundle signed with an untrusted key must be rejected")
@@ -178,6 +182,56 @@ class TestBundleSecurity(unittest.TestCase):
         ok, message, _ = self._install(bundle)
         self.assertFalse(ok, "modified model must be rejected")
         self.assertIn("sha256 mismatch", message)
+
+    def test_07_test_key_is_not_trusted_by_default(self) -> None:
+        bundle = _make_bundle(self._tmp)
+        sign_manifest(bundle)
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            ok, message, _ = self._install(bundle)
+
+        self.assertFalse(ok, "production default must not trust the dev/test key")
+        self.assertIn("unknown key_id", message)
+
+    def test_08_runtime_trust_file_accepts_public_key_without_private_key(self) -> None:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+        bundle = _make_bundle(self._tmp, app_id="prod-signed-app")
+        prod_key = Ed25519PrivateKey.generate()
+        prod_key_path = os.path.join(self._tmp, "prod_private_not_in_runtime.pem")
+        prod_private_pem = prod_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        with open(prod_key_path, "wb") as fh:
+            fh.write(prod_private_pem)
+        public_pem = prod_key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        ).decode("ascii")
+        trust_file = os.path.join(self._tmp, "trusted-public-keys.json")
+        with open(trust_file, "w", encoding="utf-8") as fh:
+            json.dump({"sydeco-production-rc2-v1": public_pem}, fh)
+
+        with open(os.path.join(bundle, "manifest.json"), "r", encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        manifest["release"]["key_id"] = "sydeco-production-rc2-v1"
+        with open(os.path.join(bundle, "manifest.json"), "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh, indent=2)
+        sign_manifest(bundle, key_path=prod_key_path)
+
+        with mock.patch.dict(
+            os.environ,
+            {"SYDECO_LIGHTML_TRUSTED_KEYS_FILE": trust_file},
+            clear=False,
+        ):
+            ok, message, entry = self._install(bundle)
+
+        self.assertTrue(ok, f"production public trust file should verify: {message}")
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["app_id"], "prod-signed-app")
 
 
 if __name__ == "__main__":

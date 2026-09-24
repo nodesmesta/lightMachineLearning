@@ -18,6 +18,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TEST_KEY_NAME = "DEVELOPMENT_TEST_KEY_DO_NOT_USE_IN_PRODUCTION"
 TEST_PRIVATE_KEY = REPO_ROOT / "devkeys" / (TEST_KEY_NAME + ".pem")
+TEST_PUBLIC_KEY = REPO_ROOT / "devkeys" / (TEST_KEY_NAME + ".pub.pem")
+TEST_KEY_ID = "sydeco-test-key-v1"
 
 
 def canonical_manifest_bytes(manifest: dict) -> bytes:
@@ -34,6 +36,16 @@ def _load_private_key(key_path) -> Ed25519PrivateKey:
     return key
 
 
+def _enable_test_trust(bundle_dir: str) -> None:
+    """Point runtime verification at a bundle-local explicit test trust file."""
+    with open(TEST_PUBLIC_KEY, "r", encoding="ascii") as fh:
+        public_pem = fh.read()
+    trust_path = os.path.join(bundle_dir, ".test_trusted_public_keys.json")
+    with open(trust_path, "w", encoding="utf-8") as fh:
+        json.dump({TEST_KEY_ID: public_pem}, fh)
+    os.environ["SYDECO_LIGHTML_TRUSTED_KEYS_FILE"] = trust_path
+
+
 def sign_manifest(bundle_dir: str, key_path=None) -> str:
     """(Re)sign bundle_dir/manifest.json -> bundle_dir/manifest.sig.
 
@@ -41,6 +53,8 @@ def sign_manifest(bundle_dir: str, key_path=None) -> str:
     repo TEST key; pass a different key_path to sign with another key
     (e.g. the 'incorrect key' bundle-security case).
     """
+    if key_path is None:
+        _enable_test_trust(bundle_dir)
     manifest_path = os.path.join(bundle_dir, "manifest.json")
     sig_path = os.path.join(bundle_dir, "manifest.sig")
     with open(manifest_path, "r", encoding="utf-8") as fh:
