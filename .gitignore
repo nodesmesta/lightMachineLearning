@@ -22,6 +22,7 @@ devkeys/
 *.pem
 *.key
 
-# Internal reports
-data/report.md
+# Internal data, reports & evidence
+data/
+
 
