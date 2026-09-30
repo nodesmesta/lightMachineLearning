@@ -16,3 +16,12 @@ data/registry/
 
 # OS
 .DS_Store
+
+# Keys, certificates & secrets
+devkeys/
+*.pem
+*.key
+
+# Internal reports
+data/report.md
+
