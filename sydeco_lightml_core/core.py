@@ -41,6 +41,36 @@ from .worker import (
 )
 
 
+def _safe_extract_zip(zip_path: str, extract_to: str) -> None:
+    """Safely extract zip archive preventing Zip Slip / path traversal."""
+    os.makedirs(extract_to, exist_ok=True)
+    real_dest = os.path.realpath(extract_to)
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for member in zf.infolist():
+            target_path = os.path.realpath(os.path.join(extract_to, member.filename))
+            if not target_path.startswith(real_dest + os.sep) and target_path != real_dest:
+                raise RuntimeError(
+                    f"Zip Slip path traversal attempt detected: {member.filename}"
+                )
+        zf.extractall(extract_to)
+
+
+def _safe_extract_tar(tar_path: str, extract_to: str) -> None:
+    """Safely extract tar archive preventing path traversal."""
+    import tarfile
+
+    os.makedirs(extract_to, exist_ok=True)
+    real_dest = os.path.realpath(extract_to)
+    with tarfile.open(tar_path, "r:*") as tf:
+        for member in tf.getmembers():
+            target_path = os.path.realpath(os.path.join(extract_to, member.name))
+            if not target_path.startswith(real_dest + os.sep) and target_path != real_dest:
+                raise RuntimeError(
+                    f"Tar path traversal attempt detected: {member.name}"
+                )
+        tf.extractall(extract_to)
+
+
 def _resolve_within_app_root(app_root: str, *parts: str, label: str) -> str:
     """Resolve a path and reject fail-closed if it escapes the app root.
 
@@ -212,7 +242,7 @@ class CoreService:
                 f"install rejected: signature path escapes app dir: {sig_name}",
                 None,
             )
-        ok_sig, sig_reason = verify_bundle_signature(manifest, sig_path)
+        ok_sig, sig_reason = verify_bundle_signature(manifest, sig_path, data_dir=self.data_dir)
         if not ok_sig:
             self.audit.append(
                 {
@@ -685,11 +715,15 @@ class CoreService:
     def _load_adapter(self, manifest: Dict[str, Any], app_root: str) -> Any:
         """Dynamically import the application's adapter (R3).
 
-        Convention (dev, documented): the adapter entry module must define
-        a class named ``Adapter`` implementing the 3.0 contract. Core
-        never imports application types statically.
+        If the manifest declares no adapter, fallback to DefaultModelAdapter (zero-code mode).
+        Otherwise, dynamically import the declared Adapter class.
         """
-        entry = manifest.get("adapter", {}).get("entry", "")
+        adapter_decl = manifest.get("adapter")
+        if not adapter_decl or not adapter_decl.get("entry"):
+            from .adapter import DefaultModelAdapter
+            return DefaultModelAdapter()
+
+        entry = adapter_decl.get("entry", "")
         path = os.path.join(app_root, entry)
         module_name = f"sydeco_app_{manifest.get('app_id', 'app')}_{manifest.get('version', '0')}"
         spec = importlib.util.spec_from_file_location(module_name, path)
@@ -817,6 +851,119 @@ class CoreService:
                 "capabilities": manifest.get("capabilities", []),
             })
         return out
+
+    def install_bundle(
+        self,
+        bundle_path: str,
+        target_apps_dir: Optional[str] = None,
+        auto_start: bool = True,
+    ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+        """Extract and install a bundle archive (.zip or .tar.gz), then start it.
+
+        Returns (ok, message, registry_entry).
+        """
+        if not os.path.isfile(bundle_path):
+            return False, f"bundle file not found: {bundle_path}", None
+
+        import tempfile
+
+        staging_dir = tempfile.mkdtemp(prefix="sydeco_bundle_stage_")
+        try:
+            # 1. Safe extraction
+            if zipfile.is_zipfile(bundle_path):
+                _safe_extract_zip(bundle_path, staging_dir)
+            elif bundle_path.endswith((".tar.gz", ".tgz", ".tar")):
+                _safe_extract_tar(bundle_path, staging_dir)
+            else:
+                return False, f"unsupported archive format for bundle: {bundle_path}", None
+
+            # 2. Locate manifest.json (at root of archive or inside a single top-level directory)
+            manifest_path = os.path.join(staging_dir, "manifest.json")
+            app_root = staging_dir
+            if not os.path.isfile(manifest_path):
+                entries = [os.path.join(staging_dir, e) for e in os.listdir(staging_dir)]
+                dirs = [e for e in entries if os.path.isdir(e)]
+                if len(dirs) == 1 and os.path.isfile(os.path.join(dirs[0], "manifest.json")):
+                    app_root = dirs[0]
+                    manifest_path = os.path.join(app_root, "manifest.json")
+                else:
+                    return False, "bundle contains no manifest.json at root", None
+
+            try:
+                manifest = load_manifest(manifest_path)
+                app_id = manifest.get("app_id", "unknown")
+                version = manifest.get("version", "0.0.0")
+            except Exception as exc:
+                return False, f"cannot read manifest in bundle: {exc}", None
+
+            # 3. Canonical destination: target_apps_dir or <data_dir>/apps/<app_id>/v<version>
+            base_apps = target_apps_dir or os.path.join(self.data_dir, "apps")
+            canonical_dest = os.path.join(base_apps, app_id, f"v{version}")
+            if os.path.exists(canonical_dest):
+                shutil.rmtree(canonical_dest)
+            os.makedirs(os.path.dirname(canonical_dest), exist_ok=True)
+            shutil.copytree(app_root, canonical_dest)
+
+            # 4. Install app from canonical location
+            canonical_manifest = os.path.join(canonical_dest, "manifest.json")
+            ok, msg, entry = self.install_app(canonical_manifest, app_root=canonical_dest)
+            if not ok:
+                return False, f"bundle installation failed: {msg}", None
+
+            # 5. Auto start if requested
+            if auto_start:
+                start_ok, start_msg, start_data = self.start_app(app_id)
+                if not start_ok:
+                    return False, f"bundle installed but failed to start: {start_msg}", entry
+
+            return True, f"bundle installed and ready: {app_id} v{version}", entry
+        except Exception as exc:
+            logging.getLogger("sydeco-lightml.core").exception("bundle installation error")
+            return False, f"bundle error: {exc}", None
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
+    def scan_incoming(self, incoming_dir: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Scan incoming directory for drop-in bundle archives and deploy them.
+
+        Manages incoming/, processed/, and failed/ subfolders.
+        """
+        incoming = incoming_dir or os.path.join(self.data_dir, "incoming")
+        processed = os.path.join(incoming, "processed")
+        failed = os.path.join(incoming, "failed")
+        os.makedirs(incoming, exist_ok=True)
+        os.makedirs(processed, exist_ok=True)
+        os.makedirs(failed, exist_ok=True)
+
+        results = []
+        for name in sorted(os.listdir(incoming)):
+            path = os.path.join(incoming, name)
+            if not os.path.isfile(path):
+                continue
+            if not (name.endswith(".zip") or name.endswith(".tar.gz") or name.endswith(".tgz")):
+                continue
+
+            # Process candidate bundle
+            logging.getLogger("sydeco-lightml.core").info("Drop-in candidate detected: %s", name)
+            ok, msg, entry = self.install_bundle(path, auto_start=True)
+            results.append({"file": name, "ok": ok, "message": msg, "entry": entry})
+
+            if ok:
+                dest = os.path.join(processed, name)
+                if os.path.exists(dest):
+                    os.remove(dest)
+                shutil.move(path, dest)
+                logging.getLogger("sydeco-lightml.core").info("Drop-in installed successfully: %s", name)
+            else:
+                dest = os.path.join(failed, name)
+                if os.path.exists(dest):
+                    os.remove(dest)
+                shutil.move(path, dest)
+                with open(dest + ".err", "w", encoding="utf-8") as fh:
+                    fh.write(msg + "\n")
+                logging.getLogger("sydeco-lightml.core").warning("Drop-in failed: %s (%s)", name, msg)
+
+        return results
 
     def serve(self, host: str = "127.0.0.1", port: Optional[int] = None) -> None:
         """Start the HTTP surface (5.1). Port: SYDECO_LIGHTML_PORT env or

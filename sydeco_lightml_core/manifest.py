@@ -36,7 +36,7 @@ MODEL_FORMAT_WHITELIST = frozenset({"joblib", "pickle", "torch"})
 # Capabilities known to Core (O3, fail-closed: unknown -> rejected).
 KNOWN_CAPABILITIES = frozenset({"inference", "ui"})
 
-# Required fields per proposal 4.3.
+# Required fields per proposal 4.3 (adapter is optional for zero-code models).
 REQUIRED_MANIFEST_FIELDS = (
     "manifest_version",
     "app_id",
@@ -44,7 +44,6 @@ REQUIRED_MANIFEST_FIELDS = (
     "version",
     "capabilities",
     "models",
-    "adapter",
     "release",
     "input_schema",
     "output_schema",
