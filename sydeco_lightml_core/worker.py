@@ -196,6 +196,11 @@ class InProcessWorkerHost(WorkerHost):
             max_workers=1, thread_name_prefix="sydeco-worker"
         )
 
+    @property
+    def adapter(self) -> Optional[Adapter]:
+        with self._lifecycle_lock:
+            return self._adapter
+
     def start(
         self,
         app_id: str,

@@ -57,7 +57,10 @@ def _print_json(obj: Any) -> None:
 def cmd_install(service: CoreService, args: argparse.Namespace) -> int:
     lock = ExclusiveLock(os.path.join(service.data_dir, "lock"))
     with lock:
-        ok, message, entry = service.install_app(args.manifest, args.root)
+        if args.manifest.endswith((".zip", ".tar.gz", ".tgz")):
+            ok, message, entry = service.install_bundle(args.manifest)
+        else:
+            ok, message, entry = service.install_app(args.manifest, args.root)
         if args.json:
             _print_json(
                 {
@@ -69,6 +72,21 @@ def cmd_install(service: CoreService, args: argparse.Namespace) -> int:
         else:
             print(message)
         return 0 if ok else 1
+
+
+def cmd_scan(service: CoreService, args: argparse.Namespace) -> int:
+    lock = ExclusiveLock(os.path.join(service.data_dir, "lock"))
+    with lock:
+        results = service.scan_incoming(args.incoming_dir)
+        if args.json:
+            _print_json({"results": results})
+        else:
+            if not results:
+                print("no candidate drop-in bundles found")
+            for r in results:
+                status = "OK" if r["ok"] else "FAIL"
+                print(f"[{status}] {r['file']}: {r['message']}")
+        return 0
 
 
 def cmd_list(service: CoreService, args: argparse.Namespace) -> int:
@@ -159,6 +177,49 @@ def cmd_serve(service: CoreService, args: argparse.Namespace) -> int:
     return 0  # unreachable while serving
 
 
+def cmd_token(service: CoreService, args: argparse.Namespace) -> int:
+    from .secrets import read_token, rotate_token
+    if args.action == "rotate":
+        new_token = rotate_token(service.data_dir, args.app_id)
+        if args.json:
+            _print_json({"app_id": args.app_id, "action": "rotate", "token": new_token})
+        else:
+            print(f"Token rotated for {args.app_id}: {new_token}")
+        return 0
+    elif args.action == "get":
+        token_record = read_token(service.data_dir, args.app_id)
+        has_token = token_record is not None
+        if args.json:
+            _print_json({"app_id": args.app_id, "has_token": has_token, "hashed": "$" in (token_record or "")})
+        else:
+            if has_token:
+                print(f"Token active for {args.app_id} (hashed on disk)")
+            else:
+                print(f"No token configured for {args.app_id}")
+        return 0 if has_token else 1
+    return 1
+
+
+def cmd_bundle_sign(service: CoreService, args: argparse.Namespace) -> int:
+    from .keys import sign_manifest_canonical
+    with open(args.manifest, "r", encoding="utf-8") as fh:
+        manifest = json.load(fh)
+    with open(args.key, "r", encoding="ascii") as fh:
+        priv_pem = fh.read()
+    sig_b64 = sign_manifest_canonical(manifest, priv_pem)
+    out_sig = args.output or os.path.join(
+        os.path.dirname(args.manifest),
+        manifest.get("release", {}).get("signature", "manifest.sig"),
+    )
+    with open(out_sig, "w", encoding="ascii") as fh:
+        fh.write(sig_b64 + "\n")
+    if args.json:
+        _print_json({"manifest": args.manifest, "signature_file": out_sig, "ok": True})
+    else:
+        print(f"Signed manifest: {out_sig}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sydeco-lightml",
@@ -171,11 +232,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_install = sub.add_parser("install", help="install/register an app")
-    p_install.add_argument("manifest", help="path to manifest.json")
+    p_install = sub.add_parser("install", help="install/register an app (from manifest.json or .zip/.tar.gz bundle)")
+    p_install.add_argument("manifest", help="path to manifest.json or bundle archive (.zip/.tar.gz)")
     p_install.add_argument("--root", default=None, help="app root dir (default: manifest dir)")
     p_install.add_argument("--json", action="store_true")
     p_install.set_defaults(func=cmd_install)
+
+    p_scan = sub.add_parser("scan", help="scan incoming directory for drop-in bundles")
+    p_scan.add_argument("--incoming-dir", default=None, help="override incoming directory")
+    p_scan.add_argument("--json", action="store_true")
+    p_scan.set_defaults(func=cmd_scan)
 
     p_list = sub.add_parser("list", help="list registered apps")
     p_list.add_argument("--json", action="store_true")
@@ -212,6 +278,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", default=None, type=int)
     p_serve.set_defaults(func=cmd_serve)
+
+    p_token = sub.add_parser("token", help="manage application Bearer tokens")
+    p_token.add_argument("action", choices=["get", "rotate"])
+    p_token.add_argument("app_id")
+    p_token.add_argument("--json", action="store_true")
+    p_token.set_defaults(func=cmd_token)
+
+    p_sign = sub.add_parser("sign-manifest", help="sign a manifest.json with an Ed25519 private key")
+    p_sign.add_argument("manifest", help="path to manifest.json")
+    p_sign.add_argument("--key", required=True, help="path to private key PEM file")
+    p_sign.add_argument("--output", default=None, help="output signature path (default: manifest.sig in manifest dir)")
+    p_sign.add_argument("--json", action="store_true")
+    p_sign.set_defaults(func=cmd_bundle_sign)
     return parser
 
 

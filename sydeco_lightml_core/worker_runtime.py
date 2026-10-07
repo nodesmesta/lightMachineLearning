@@ -143,10 +143,15 @@ def _check_bearer(runtime: Any, presented: Optional[str]) -> bool:
 def load_adapter(manifest: Dict[str, Any], app_root: str) -> Any:
     """Import the bundle adapter (3.0/R3) — same convention as Core.
 
-    The adapter entry module must define a class named ``Adapter``
-    implementing the 3.0 contract.
+    If the manifest declares no adapter, fallback to DefaultModelAdapter (zero-code mode).
+    Otherwise, dynamically import the declared Adapter class.
     """
-    entry = manifest.get("adapter", {}).get("entry", "")
+    adapter_decl = manifest.get("adapter")
+    if not adapter_decl or not adapter_decl.get("entry"):
+        from .adapter import DefaultModelAdapter
+        return DefaultModelAdapter()
+
+    entry = adapter_decl.get("entry", "")
     path = os.path.join(app_root, entry)
     module_name = f"sydeco_worker_{manifest.get('app_id', 'app')}"
     spec = importlib.util.spec_from_file_location(module_name, path)

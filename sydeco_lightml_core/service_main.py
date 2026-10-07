@@ -6,6 +6,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 from typing import Sequence
 
 from .core import CoreService
@@ -36,6 +37,33 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+class IncomingBundleWatcher(threading.Thread):
+    """Daemon thread for continuous scanning and deployment of drop-in bundles."""
+
+    def __init__(
+        self,
+        service: CoreService,
+        incoming_dir: str | None = None,
+        interval: float = 2.0,
+    ) -> None:
+        super().__init__(daemon=True, name="IncomingBundleWatcher")
+        self.service = service
+        self.incoming_dir = incoming_dir
+        self.interval = interval
+        self._stopping = threading.Event()
+
+    def stop(self) -> None:
+        self._stopping.set()
+
+    def run(self) -> None:
+        while not self._stopping.is_set():
+            try:
+                self.service.scan_incoming(self.incoming_dir)
+            except Exception:
+                logging.getLogger("sydeco-lightml.service").exception("incoming scanner error")
+            self._stopping.wait(timeout=self.interval)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(
@@ -58,6 +86,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
+    watcher_thread = IncomingBundleWatcher(service=service)
+    watcher_thread.start()
+
     logging.getLogger("sydeco-lightml.service").info(
         "serving host=%s port=%s data_dir=%s worker_mode=%s",
         args.host,
@@ -69,6 +100,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         httpd.serve_forever(poll_interval=0.2)
     finally:
         httpd.server_close()
+        watcher_thread.join(timeout=1.0)
         for app_id in list(service._hosts):
             try:
                 service.stop_app(app_id)

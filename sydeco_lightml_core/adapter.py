@@ -60,3 +60,83 @@ class Adapter(abc.ABC):
     def shutdown(self) -> None:
         """Release application resources gracefully (bounded 30 s)."""
         raise NotImplementedError
+
+
+class DefaultModelAdapter(Adapter):
+    """Built-in universal adapter for zero-code model bundles.
+
+    When an application bundle contains model artifacts but no custom
+    adapter/main.py, the worker activates this default adapter. It automatically
+    inspects loaded models, binds the primary model, and routes inference
+    requests to the model's standard inference methods (.predict / .predict_proba).
+    """
+
+    def __init__(self) -> None:
+        self.models: dict[str, Any] = {}
+        self.primary_model: Any = None
+        self.primary_role: str = ""
+
+    def initialize(self, context: dict[str, Any]) -> None:
+        self.models = context.get("models", {})
+        if not self.models:
+            raise RuntimeError(
+                "DefaultModelAdapter requires at least one loaded model in context['models']"
+            )
+
+        # Determine primary model: prefer role 'primary', 'classifier', 'model', or first role
+        for preferred in ("primary", "classifier", "model"):
+            if preferred in self.models:
+                self.primary_role = preferred
+                self.primary_model = self.models[preferred]
+                break
+        if self.primary_model is None:
+            self.primary_role = next(iter(self.models))
+            self.primary_model = self.models[self.primary_role]
+
+    def infer(self, request: dict[str, Any], context: dict[str, Any]) -> Any:
+        if self.primary_model is None:
+            raise RuntimeError(
+                "DefaultModelAdapter is not initialized or has no primary model"
+            )
+
+        # Extract inputs from request: look for 'inputs', 'features', 'text', 'data', or request itself
+        inputs = None
+        for key in ("inputs", "features", "text", "data"):
+            if key in request:
+                inputs = request[key]
+                break
+        if inputs is None:
+            inputs = request
+
+        # Execute model prediction
+        model = self.primary_model
+        if hasattr(model, "predict_proba"):
+            try:
+                preds = model.predict_proba(inputs)
+            except Exception:
+                preds = model.predict(inputs) if hasattr(model, "predict") else model(inputs)
+        elif hasattr(model, "predict"):
+            preds = model.predict(inputs)
+        elif callable(model):
+            preds = model(inputs)
+        else:
+            raise RuntimeError(
+                f"Primary model {self.primary_role} is not callable and has no predict method"
+            )
+
+        # Convert numpy array / tensor to python native types if needed
+        if hasattr(preds, "tolist"):
+            result_val = preds.tolist()
+        else:
+            result_val = preds
+
+        return {
+            "result": result_val,
+            "status": "ok",
+            "model_role": self.primary_role,
+        }
+
+    def shutdown(self) -> None:
+        self.models.clear()
+        self.primary_model = None
+
