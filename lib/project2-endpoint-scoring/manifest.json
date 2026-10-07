@@ -1,0 +1,76 @@
+{
+  "manifest_version": 1,
+  "app_id": "project2-endpoint-scoring",
+  "name": "Project2 Endpoint Telemetry Anomaly Scorer",
+  "version": "1.0.0",
+  "capabilities": [
+    "inference"
+  ],
+  "models": [
+    {
+      "role": "primary",
+      "file": "model.pkl",
+      "format": "pickle",
+      "sha256": "90b30ca6d9b84d7fdc421aecbe1af76cf43fba3ae0a159df17fdb66a948269ab"
+    }
+  ],
+  "release": {
+    "key_id": "sydeco-test-key-v1",
+    "signature": "manifest.sig"
+  },
+  "input_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "required": [
+      "features"
+    ],
+    "properties": {
+      "trace_id": {
+        "type": "string"
+      },
+      "process_context": {
+        "type": "object"
+      },
+      "features": {
+        "type": "array",
+        "items": {
+          "type": "number"
+        },
+        "minItems": 12,
+        "maxItems": 12
+      }
+    }
+  },
+  "output_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "required": [
+      "result",
+      "status",
+      "model_role"
+    ],
+    "properties": {
+      "result": {
+        "type": "array"
+      },
+      "status": {
+        "type": "string"
+      },
+      "model_role": {
+        "type": "string"
+      }
+    }
+  },
+  "permissions": {
+    "network": "none"
+  },
+  "api": {
+    "authentication": "token"
+  },
+  "resource_limits": {
+    "max_memory": 268435456,
+    "max_cpu": 50,
+    "inference_timeout": 5,
+    "concurrency": 1
+  }
+}
