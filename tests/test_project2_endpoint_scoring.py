@@ -112,6 +112,33 @@ class TestProject2EndpointScoringBundle(unittest.TestCase):
 
         adapter.shutdown()
 
+    def test_07_fail_closed_validation_missing_and_invalid_features(self) -> None:
+        artifacts = load_artifacts(self.manifest, BUNDLE_DIR)
+        model = artifacts["primary"]
+
+        # 1. Empty dict must raise ValueError fail-closed
+        with self.assertRaises(ValueError) as ctx_empty:
+            model.predict_proba({})
+        self.assertIn("missing required telemetry features", str(ctx_empty.exception).lower())
+
+        # 2. Incomplete dict missing key must raise ValueError fail-closed
+        partial_payload = {"pid_ratio": 0.05, "ppid_ratio": 0.01}
+        with self.assertRaises(ValueError) as ctx_missing:
+            model.predict_proba(partial_payload)
+        self.assertIn("missing required telemetry features", str(ctx_missing.exception).lower())
+
+        # 3. Non-numeric or NaN values must be rejected
+        nan_payload = {k: 0.1 for k in model.feature_names_in_}
+        nan_payload["token_entropy"] = float("nan")
+        with self.assertRaises(ValueError) as ctx_nan:
+            model.predict_proba(nan_payload)
+        self.assertIn("finite numeric value", str(ctx_nan.exception).lower())
+
+        # 4. Dimension mismatch on vector input must raise ValueError
+        with self.assertRaises(ValueError):
+            model.predict_proba([0.1] * 5)
+
 
 if __name__ == "__main__":
     unittest.main()
+

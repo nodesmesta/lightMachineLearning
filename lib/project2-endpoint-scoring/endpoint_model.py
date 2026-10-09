@@ -127,17 +127,58 @@ class EndpointIsolationForest:
             )
         avg_path = sum(t.path_length(x) for t in self.trees) / len(self.trees)
         raw_score = 2.0 ** (-avg_path / self.c_psi)
-        # Calibrated Sigmoid: normal processes baseline ~0.557 -> score ~0.16
-        # Anomalies with shorter path lengths ~0.639 -> score ~0.84 (> 0.75 threshold)
+        # Empirical Sigmoid Scaling:
+        # Note (Statistical Integrity / Finding 4): This mapping is an empirical monotonic transformation
+        # of raw path-length anomaly scores to the [0.0, 1.0] interval (separating baseline ~0.557 -> ~0.16
+        # from anomalous short path lengths ~0.639 -> ~0.84). It represents an empirical anomaly metric,
+        # NOT a statistically calibrated posterior probability P(Y=1|X) (which requires empirical Platt scaling
+        # or isotonic regression over verified ground-truth distribution).
         z = (raw_score - 0.598) / 0.025
-        calibrated = 1.0 / (1.0 + math.exp(-z))
-        return round(float(calibrated), 4)
+        scaled_score = 1.0 / (1.0 + math.exp(-z))
+        return round(float(scaled_score), 4)
 
     def predict_proba(self, X: Any) -> List[List[float]]:
         if isinstance(X, dict):
-            X = [X.get(k, 0.0) for k in self.feature_names_in_]
-        if isinstance(X, (list, tuple)) and X and isinstance(X[0], (int, float)):
-            X = [X]
+            missing = [k for k in self.feature_names_in_ if k not in X]
+            if missing:
+                raise ValueError(
+                    f"Payload missing required telemetry features: {missing}"
+                )
+            row = []
+            for k in self.feature_names_in_:
+                val = X[k]
+                if not isinstance(val, (int, float)) or isinstance(val, bool) or math.isnan(val) or math.isinf(val):
+                    raise ValueError(
+                        f"Feature '{k}' must be a finite numeric value, got: {val!r}"
+                    )
+                row.append(float(val))
+            X = [row]
+        elif isinstance(X, (list, tuple)) and X and isinstance(X[0], (int, float)):
+            row = []
+            for idx, val in enumerate(X):
+                if not isinstance(val, (int, float)) or isinstance(val, bool) or math.isnan(val) or math.isinf(val):
+                    raise ValueError(
+                        f"Feature at index {idx} must be a finite numeric value, got: {val!r}"
+                    )
+                row.append(float(val))
+            X = [row]
+        elif isinstance(X, (list, tuple)):
+            validated_rows = []
+            for r_idx, row in enumerate(X):
+                if not isinstance(row, (list, tuple)):
+                    raise ValueError(f"Row {r_idx} must be a list or tuple of numeric features")
+                v_row = []
+                for idx, val in enumerate(row):
+                    if not isinstance(val, (int, float)) or isinstance(val, bool) or math.isnan(val) or math.isinf(val):
+                        raise ValueError(
+                            f"Feature at row {r_idx}, index {idx} must be a finite numeric value, got: {val!r}"
+                        )
+                    v_row.append(float(val))
+                validated_rows.append(v_row)
+            X = validated_rows
+        else:
+            raise ValueError(f"Unsupported input type for inference: {type(X).__name__}")
+
         results = []
         for row in X:
             anomaly_score = self.score_single(row)
