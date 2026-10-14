@@ -1,0 +1,105 @@
+{
+  "manifest_version": 1,
+  "app_id": "socsoar-alert-scoring",
+  "name": "SYDECO Sovereign SOAR Alert & Anomaly Scoring Engine",
+  "version": "1.0.0",
+  "capabilities": [
+    "inference"
+  ],
+  "models": [
+    {
+      "role": "primary",
+      "file": "models/model.pkl",
+      "format": "pickle",
+      "sha256": "90b30ca6d9b84d7fdc421aecbe1af76cf43fba3ae0a159df17fdb66a948269ab"
+    }
+  ],
+  "adapter": {
+    "entry": "adapter/main.py",
+    "files": [
+      {
+        "file": "adapter/main.py",
+        "sha256": "93bbd3a02855e1f5bab9299c9a99e67e642f199f1a9cbf03ce815712e366541c"
+      }
+    ]
+  },
+  "release": {
+    "key_id": "sydeco-test-key-v1",
+    "signature": "manifest.sig"
+  },
+  "input_schema": {
+    "": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "event_id": {
+        "type": "string"
+      },
+      "timestamp": {
+        "type": "string"
+      },
+      "source_category": {
+        "type": "string"
+      },
+      "telemetry": {
+        "type": "object"
+      },
+      "features": {
+        "type": "array"
+      }
+    }
+  },
+  "output_schema": {
+    "": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "required": [
+      "status",
+      "anomaly_score",
+      "model_version",
+      "receipt_hash"
+    ],
+    "properties": {
+      "status": {
+        "type": "string"
+      },
+      "app_id": {
+        "type": "string"
+      },
+      "inference_id": {
+        "type": "string"
+      },
+      "model_version": {
+        "type": "string"
+      },
+      "anomaly_score": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "confidence": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "receipt_hash": {
+        "type": "string"
+      },
+      "timestamp": {
+        "type": "string"
+      }
+    }
+  },
+  "permissions": {
+    "network": "none"
+  },
+  "api": {
+    "authentication": "token"
+  },
+  "resource_limits": {
+    "max_memory": 268435456,
+    "max_cpu": 50,
+    "inference_timeout": 15,
+    "concurrency": 1
+  }
+}

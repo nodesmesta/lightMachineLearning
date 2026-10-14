@@ -195,13 +195,18 @@ class CoreHandler(BaseHTTPRequestHandler):
             self._handle_ingest(match.group("app_id"))
             return
         match = _INFER_RE.match(path)
-        if not match:
-            self._send_json(404, {
-                "error": {"code": "404", "message": "unknown endpoint"},
-                "request_id": new_request_id(),
-            })
+        if match:
+            self._handle_infer(match.group("app_id"))
             return
-        self._handle_infer(match.group("app_id"))
+        if path.startswith("/v2/apps/") and path.endswith("/invocations"):
+            parts = path.split("/")
+            if len(parts) == 5 and parts[1] == "v2" and parts[2] == "apps" and parts[4] == "invocations":
+                self._handle_infer(parts[3])
+                return
+        self._send_json(404, {
+            "error": {"code": "404", "message": "unknown endpoint"},
+            "request_id": new_request_id(),
+        })
 
     def _handle_ingest(self, app_id: str) -> None:
         """Generic bounded local file ingestion.
@@ -462,6 +467,8 @@ class CoreHandler(BaseHTTPRequestHandler):
             "app": app_id,
             "app_version": version,
         }
+        if isinstance(result_obj.get("result"), dict):
+            envelope.update(result_obj["result"])
         envelope.update(result_obj)
         duration_ms = int((time.time() - started) * 1000)
         audit_result = "ok" if adapter_status < 400 else "fail"

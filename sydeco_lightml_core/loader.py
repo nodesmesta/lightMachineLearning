@@ -135,6 +135,13 @@ def load_artifacts(manifest: Dict[str, Any], app_root: str) -> Dict[str, Any]:
     if len(order) != len(by_role):
         raise LoadError("model dependency cycle detected (E3)")
 
+    import sys
+    app_root_abs = os.path.abspath(app_root)
+    for sub in ("", "models", "adapter"):
+        p = os.path.abspath(os.path.join(app_root_abs, sub)) if sub else app_root_abs
+        if os.path.isdir(p) and p not in sys.path:
+            sys.path.insert(0, p)
+
     loaded: Dict[str, Any] = {}
     for role in order:
         m = by_role[role]
