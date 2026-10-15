@@ -18,12 +18,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from sydeco_lightml_core.core import CoreService
-from sydeco_lightml_core.secrets import write_token
+from sydeco_lightml_core.secrets import generate_token, write_token
 
 DATA_DIR = REPO_ROOT / "run_data"
 DEV_PUB_KEY = REPO_ROOT / "devkeys/DEVELOPMENT_TEST_KEY_DO_NOT_USE_IN_PRODUCTION.pub.pem"
 SOCSOAR_MANIFEST = REPO_ROOT / "bundles/socsoar-alert-scoring/manifest.json"
-DEFAULT_TOKEN = "sydeco_lightml_sovereign_token_default"
 PORT = int(os.environ.get("SYDECO_LIGHTML_PORT", "8000"))
 HOST = "127.0.0.1"
 
@@ -49,8 +48,22 @@ def setup_service() -> CoreService:
             sys.exit(1)
         print(f"Successfully installed {app_id}")
 
-    # 4. Provision default bearer token
-    write_token(str(DATA_DIR), app_id, DEFAULT_TOKEN)
+    # 4. Protected runtime bearer token provisioning (no hardcoded credentials)
+    env_token = os.environ.get("SYDECO_LIGHTML_BEARER_TOKEN")
+    token_file = DATA_DIR / "secrets" / f"{app_id}.token"
+    runtime_token_file = DATA_DIR / "secrets" / f"{app_id}.runtime.token"
+    if env_token:
+        write_token(str(DATA_DIR), app_id, env_token)
+    elif not token_file.exists():
+        new_token = generate_token()
+        write_token(str(DATA_DIR), app_id, new_token)
+        fd = os.open(str(runtime_token_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(new_token)
+        try:
+            os.chmod(str(runtime_token_file), 0o600)
+        except OSError:
+            pass
 
     # 5. Start worker
     ok, msg, _ = service.start_app(app_id)
