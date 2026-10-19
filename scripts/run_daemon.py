@@ -20,11 +20,12 @@ sys.path.insert(0, str(REPO_ROOT))
 from sydeco_lightml_core.core import CoreService
 from sydeco_lightml_core.secrets import generate_token, write_token
 
-DATA_DIR = REPO_ROOT / "run_data"
+DATA_DIR_ENV = os.environ.get("SYDECO_LIGHTML_DATA_DIR")
+DATA_DIR = Path(DATA_DIR_ENV) if DATA_DIR_ENV else (REPO_ROOT / "run_data")
 DEV_PUB_KEY = REPO_ROOT / "devkeys/DEVELOPMENT_TEST_KEY_DO_NOT_USE_IN_PRODUCTION.pub.pem"
 SOCSOAR_MANIFEST = REPO_ROOT / "bundles/socsoar-alert-scoring/manifest.json"
 PORT = int(os.environ.get("SYDECO_LIGHTML_PORT", "8000"))
-HOST = "127.0.0.1"
+HOST = os.environ.get("SYDECO_LIGHTML_HOST", "127.0.0.1")
 
 
 def setup_service() -> CoreService:
