@@ -19,7 +19,7 @@
     "files": [
       {
         "file": "adapter/main.py",
-        "sha256": "93bbd3a02855e1f5bab9299c9a99e67e642f199f1a9cbf03ce815712e366541c"
+        "sha256": "a05a47885c00b7692b27a226414934e62c94878f6e2b2a8dc2c16d5b8e31093a"
       }
     ]
   },
@@ -41,10 +41,86 @@
         "type": "string"
       },
       "telemetry": {
-        "type": "object"
+        "type": "object",
+        "required": [
+          "pid_ratio",
+          "ppid_ratio",
+          "cmd_len",
+          "arg_count",
+          "token_entropy",
+          "uid_class",
+          "start_tick_delta",
+          "mem_rss_ratio",
+          "cpu_tick_ratio",
+          "fd_count",
+          "thread_count",
+          "privilege_flag"
+        ],
+        "properties": {
+          "pid_ratio": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "ppid_ratio": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "cmd_len": {
+            "type": "number",
+            "minimum": 0.0
+          },
+          "arg_count": {
+            "type": "number",
+            "minimum": 0.0
+          },
+          "token_entropy": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 8.0
+          },
+          "uid_class": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 3.0
+          },
+          "start_tick_delta": {
+            "type": "number",
+            "minimum": 0.0
+          },
+          "mem_rss_ratio": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "cpu_tick_ratio": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "fd_count": {
+            "type": "number",
+            "minimum": 0.0
+          },
+          "thread_count": {
+            "type": "number",
+            "minimum": 1.0
+          },
+          "privilege_flag": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0
+          }
+        }
       },
       "features": {
-        "type": "array"
+        "type": "array",
+        "minItems": 12,
+        "maxItems": 12,
+        "items": {
+          "type": "number"
+        }
       }
     }
   },
@@ -53,7 +129,6 @@
     "type": "object",
     "required": [
       "status",
-      "anomaly_score",
       "model_version",
       "receipt_hash"
     ],
@@ -86,6 +161,12 @@
         "type": "string"
       },
       "timestamp": {
+        "type": "string"
+      },
+      "http_status": {
+        "type": "integer"
+      },
+      "error": {
         "type": "string"
       }
     }
