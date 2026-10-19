@@ -42,25 +42,31 @@ def setup_service() -> CoreService:
 
     # 3. Install bundle if not registered or update
     app_id = "socsoar-alert-scoring"
+    runtime_token_file = DATA_DIR / "secrets" / f"{app_id}.runtime.token"
+    env_token = os.environ.get("SYDECO_LIGHTML_BEARER_TOKEN")
+
     if service.registry.get(app_id) is None:
-        ok, msg, _ = service.install_app(str(SOCSOAR_MANIFEST), app_root=str(SOCSOAR_MANIFEST.parent))
+        ok, msg, entry = service.install_app(str(SOCSOAR_MANIFEST), app_root=str(SOCSOAR_MANIFEST.parent))
         if not ok:
             print(f"Failed to install {app_id}: {msg}", file=sys.stderr)
             sys.exit(1)
         print(f"Successfully installed {app_id}")
+        if entry and entry.get("token"):
+            new_token = entry["token"]
+            fd = os.open(str(runtime_token_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(new_token)
+            try:
+                os.chmod(str(runtime_token_file), 0o600)
+            except OSError:
+                pass
 
     # 4. Protected runtime bearer token provisioning (no hardcoded credentials)
-    env_token = os.environ.get("SYDECO_LIGHTML_BEARER_TOKEN")
-    token_file = DATA_DIR / "secrets" / f"{app_id}.token"
-    runtime_token_file = DATA_DIR / "secrets" / f"{app_id}.runtime.token"
     if env_token:
         write_token(str(DATA_DIR), app_id, env_token)
-    elif not token_file.exists():
-        new_token = generate_token()
-        write_token(str(DATA_DIR), app_id, new_token)
         fd = os.open(str(runtime_token_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(new_token)
+            fh.write(env_token)
         try:
             os.chmod(str(runtime_token_file), 0o600)
         except OSError:
