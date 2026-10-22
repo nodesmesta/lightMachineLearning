@@ -18,6 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from sydeco_lightml_core.core import CoreService
+from sydeco_lightml_core.keys import DEFAULT_DEV_PUBKEY_PEM
 from sydeco_lightml_core.secrets import generate_token, write_token
 
 DATA_DIR_ENV = os.environ.get("SYDECO_LIGHTML_DATA_DIR")
@@ -32,8 +33,11 @@ def setup_service() -> CoreService:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     # 1. Setup trusted public keys
-    with open(DEV_PUB_KEY, "r", encoding="ascii") as fh:
-        pub_pem = fh.read()
+    if DEV_PUB_KEY.exists():
+        with open(DEV_PUB_KEY, "r", encoding="ascii") as fh:
+            pub_pem = fh.read()
+    else:
+        pub_pem = DEFAULT_DEV_PUBKEY_PEM
     with open(DATA_DIR / "trusted_keys.json", "w", encoding="utf-8") as fh:
         json.dump({"sydeco-test-key-v1": pub_pem}, fh)
 

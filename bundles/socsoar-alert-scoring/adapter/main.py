@@ -8,6 +8,7 @@ import time
 from typing import Any, Dict, List
 
 from sydeco_lightml_core.adapter import Adapter
+from sydeco_lightml_core.schema import validate_schema
 
 FEATURE_KEYS = [
     'pid_ratio', 'ppid_ratio', 'cmd_len', 'arg_count', 'token_entropy',
@@ -25,6 +26,7 @@ class Adapter(Adapter):
                 self.model = next(iter(models.values()))
             else:
                 raise RuntimeError('No primary model found in context')
+        self.telemetry_schema = context['config']['input_schema']['properties']['telemetry']
 
     def infer(self, request: Dict[str, Any], context: Dict[str, Any]) -> Any:
         event_id = request.get('event_id', context.get('request_id', 'evt-default'))
@@ -73,8 +75,11 @@ class Adapter(Adapter):
 
             if len(vec) != 12:
                 raise ValueError(f"Expected exactly 12 features, got {len(vec)}")
+            errors = validate_schema(dict(zip(FEATURE_KEYS, vec)), self.telemetry_schema, '$.telemetry')
+            if errors:
+                raise ValueError('; '.join(errors))
 
-        except (ValueError, TypeError) as exc:
+        except (ValueError, TypeError, OverflowError) as exc:
             return {
                 'status': 'error',
                 'http_status': 400,
