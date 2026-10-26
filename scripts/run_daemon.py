@@ -49,12 +49,14 @@ def setup_service() -> CoreService:
     runtime_token_file = DATA_DIR / "secrets" / f"{app_id}.runtime.token"
     env_token = os.environ.get("SYDECO_LIGHTML_BEARER_TOKEN")
 
-    if service.registry.get(app_id) is None:
+    reg_entry = service.registry.get(app_id)
+    manifest_obj = json.loads(SOCSOAR_MANIFEST.read_text())
+    if reg_entry is None or reg_entry.get("manifest") != manifest_obj:
         ok, msg, entry = service.install_app(str(SOCSOAR_MANIFEST), app_root=str(SOCSOAR_MANIFEST.parent))
         if not ok:
             print(f"Failed to install {app_id}: {msg}", file=sys.stderr)
             sys.exit(1)
-        print(f"Successfully installed {app_id}")
+        print(f"Successfully installed/updated {app_id}")
         if entry and entry.get("token"):
             new_token = entry["token"]
             fd = os.open(str(runtime_token_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
