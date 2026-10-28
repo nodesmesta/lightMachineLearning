@@ -51,7 +51,9 @@ def setup_service() -> CoreService:
 
     reg_entry = service.registry.get(app_id)
     manifest_obj = json.loads(SOCSOAR_MANIFEST.read_text())
-    if reg_entry is None or reg_entry.get("manifest") != manifest_obj:
+    active = (reg_entry or {}).get("active_version")
+    registered_manifest = (reg_entry or {}).get("versions", {}).get(active, {}).get("manifest")
+    if reg_entry is None or registered_manifest != manifest_obj:
         ok, msg, entry = service.install_app(str(SOCSOAR_MANIFEST), app_root=str(SOCSOAR_MANIFEST.parent))
         if not ok:
             print(f"Failed to install {app_id}: {msg}", file=sys.stderr)

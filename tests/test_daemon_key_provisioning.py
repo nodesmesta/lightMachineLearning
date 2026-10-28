@@ -21,7 +21,9 @@ class DaemonKeyProvisioningTests(unittest.TestCase):
         self.launcher.DATA_DIR = Path(self.tmp.name) / "data"
         self.launcher.DEV_PUB_KEY = Path(self.tmp.name) / "development.pub.pem"
         self.service = Mock()
-        self.service.registry.get.return_value = {"app_id": "socsoar-alert-scoring"}
+        manifest = json.loads(self.launcher.SOCSOAR_MANIFEST.read_text())
+        version = manifest["version"]
+        self.service.registry.get.return_value = {"app_id": "socsoar-alert-scoring", "active_version": version, "versions": {version: {"manifest": manifest}}}
         self.service.start_app.return_value = (True, "started", None)
 
     def setup_and_read_key(self):
