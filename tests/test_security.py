@@ -21,6 +21,7 @@ event. Stdlib unittest only.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import shutil
@@ -142,12 +143,16 @@ class SecurityTests(unittest.TestCase):
         m["capabilities"] = ["inference", "teleport"]
         self._assert_rejected(app_dir, m, "unknown capability")
 
-    # 5. missing adapter
-    def test_05_missing_adapter(self) -> None:
+    # 5. zero-code model may omit a custom adapter
+    def test_05_missing_adapter_uses_default_adapter(self) -> None:
         app_dir = self._app_dir()
         m = copy.deepcopy(VALID_MANIFEST)
         del m["adapter"]
-        self._assert_rejected(app_dir, m, "missing required field: adapter")
+        m["models"][0]["sha256"] = hashlib.sha256(b"dummy-model").hexdigest()
+        path = self._write_manifest(app_dir, m)
+        ok, message, entry = self.service.install_app(path)
+        self.assertTrue(ok, f"zero-code model install should succeed: {message!r}")
+        self.assertIsNotNone(entry)
 
     # 6. missing model
     def test_06_missing_model(self) -> None:

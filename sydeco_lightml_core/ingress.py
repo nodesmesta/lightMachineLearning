@@ -133,6 +133,11 @@ class IngressStore:
         if not os.path.isdir(root):
             return usage
         for name in os.listdir(root):
+            if ".claimed-" in name:
+                # Claimed references are already in-flight and no longer
+                # consume the pending-upload quota. Cleanup is still owned by
+                # the inference request's finally block.
+                continue
             path = os.path.join(root, name)
             meta = os.path.join(path, "metadata.json")
             if not os.path.isdir(path) or not os.path.isfile(meta):

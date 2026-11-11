@@ -115,6 +115,40 @@ def _run_preflight(command: List[str], prerequisite: str, purpose: str) -> None:
         )
 
 
+def _python_with_pip() -> str:
+    """Select an available Python interpreter with pip for app environments.
+
+    Hermes and other embedded runners may expose a ``python3`` without pip,
+    while the host OS Python has the required packaging prerequisite. Prefer
+    the current interpreter when it is complete, then fall back to trusted
+    ``python3`` candidates without changing the offline dependency policy.
+    """
+    candidates = [sys.executable, shutil.which("python3"), "/usr/bin/python3", shutil.which("python")]
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        resolved = os.path.realpath(os.path.abspath(candidate))
+        if resolved in seen or not os.path.isfile(resolved):
+            continue
+        seen.add(resolved)
+        try:
+            proc = subprocess.run(
+                [resolved, "-m", "pip", "--version"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if proc.returncode == 0:
+            return resolved
+    raise RuntimeError(
+        "install rejected: missing OS prerequisite python3-pip: "
+        "no candidate Python interpreter provides 'python -m pip'"
+    )
+
+
 def _trusted_os_python_targets() -> set[str]:
     """Return trusted OS/Core Python realpaths accepted as venv symlink targets."""
     candidates = {sys.executable}
@@ -518,13 +552,14 @@ class CoreService:
         # must leave NO half-valid environment (reviewer P5).
         venv_created = False
         try:
+            runtime_python = _python_with_pip()
             _run_preflight(
-                ["python3", "-m", "venv", "--help"],
+                [runtime_python, "-m", "venv", "--help"],
                 "python3-venv",
                 "required to create the per-app venv",
             )
             _run_preflight(
-                [sys.executable, "-m", "pip", "--version"],
+                [runtime_python, "-m", "pip", "--version"],
                 "python3-pip",
                 "required to install app dependencies from the local wheelhouse",
             )
@@ -549,7 +584,7 @@ class CoreService:
             # Create the per-app venv. venv creation needs only OS-dependency
             # python3-venv/ensurepip.
             subprocess.run(
-                ["python3", "-m", "venv", "--without-pip", venv_dir],
+                [runtime_python, "-m", "venv", "--without-pip", venv_dir],
                 capture_output=True, text=True, check=True, timeout=120,
             )
             venv_created = True
@@ -561,7 +596,7 @@ class CoreService:
             # Install ONLY from the local wheelhouse — --no-index,
             # --find-links, no PyPI lookup, no implicit network fallback.
             pip_cmd = [
-                sys.executable, "-m", "pip", "install", "--prefix", venv_dir,
+                runtime_python, "-m", "pip", "install", "--prefix", venv_dir,
                 "--ignore-installed", "--no-index", "--no-deps", f"--find-links={wheelhouse}",
                 *[f"{name}=={version}" for name, version in sorted(declared)]
             ]

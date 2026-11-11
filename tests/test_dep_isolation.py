@@ -30,7 +30,7 @@ import time
 import unittest
 from unittest import mock
 
-from sydeco_lightml_core.core import CoreService
+from sydeco_lightml_core.core import CoreService, _python_with_pip
 from tests._signing import sign_manifest
 
 # ---- fixture: build a stdlib-only ballast wheel for a given version -----
@@ -66,8 +66,17 @@ def _build_ballast_wheel(tmp: str, version: str) -> str:
     wheels = os.path.join(tmp, "wheels")
     os.makedirs(wheels, exist_ok=True)
     proj = os.path.dirname(src)  # the project dir containing setup.py
+    wheel_python = _python_with_pip()
+    probe = subprocess.run(
+        [wheel_python, "-c", "import setuptools"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if probe.returncode != 0 and os.path.isfile("/usr/bin/python3"):
+        wheel_python = "/usr/bin/python3"
     subprocess.run(
-        ["python3", "-m", "pip", "wheel", "--no-deps", "--no-build-isolation",
+        [wheel_python, "-m", "pip", "wheel", "--no-deps", "--no-build-isolation",
          "--wheel-dir", wheels, proj],
         capture_output=True, text=True, check=True, timeout=180,
     )
@@ -439,7 +448,7 @@ class DepIsolationTests(unittest.TestCase):
         real_run = subprocess.run
 
         def fake_run(argv, *args, **kwargs):
-            if argv[:3] == ["python3", "-m", "venv"]:
+            if len(argv) >= 3 and argv[1:3] == ["-m", "venv"]:
                 os.makedirs(os.path.join(root, "venv", "bin"), exist_ok=True)
                 with open(os.path.join(root, "venv", "bin", "python"), "w", encoding="utf-8") as fh:
                     fh.write("#!/bin/sh\n")
@@ -525,9 +534,10 @@ class DepIsolationTests(unittest.TestCase):
         shutil.copy(wheel, wheelhouse)
         manifest = _manifest("app-force-local-wheel", "1.0.0", "1.0.0")
         pip_commands = []
+        real_run = subprocess.run
 
         def fake_run(argv, *args, **kwargs):
-            if argv[:3] == ["python3", "-m", "venv"]:
+            if len(argv) >= 3 and argv[1:3] == ["-m", "venv"]:
                 os.makedirs(os.path.join(root, "venv", "bin"), exist_ok=True)
                 with open(os.path.join(root, "venv", "bin", "python"), "w", encoding="utf-8") as fh:
                     fh.write("#!/bin/sh\n")
@@ -537,7 +547,7 @@ class DepIsolationTests(unittest.TestCase):
             if len(argv) >= 4 and argv[1:4] == ["-m", "pip", "install"]:
                 pip_commands.append(list(argv))
                 return subprocess.CompletedProcess(argv, 0, stdout="installed", stderr="")
-            return subprocess.run(argv, *args, **kwargs)
+            return real_run(argv, *args, **kwargs)
 
         with mock.patch("sydeco_lightml_core.core.subprocess.run", side_effect=fake_run):
             self._core.build_app_venv("app-force-local-wheel", manifest, root)
@@ -685,7 +695,7 @@ class DepIsolationTests(unittest.TestCase):
         real_run = subprocess.run
 
         def fake_run(argv, *args, **kwargs):
-            if argv[:3] == ["python3", "-m", "venv"]:
+            if len(argv) >= 3 and argv[1:3] == ["-m", "venv"]:
                 raise subprocess.CalledProcessError(
                     1, argv, stderr="simulated venv create failure"
                 )
@@ -714,7 +724,7 @@ class DepIsolationTests(unittest.TestCase):
         real_run = subprocess.run
 
         def fake_run(argv, *args, **kwargs):
-            if argv[:3] == ["python3", "-m", "venv"]:
+            if len(argv) >= 3 and argv[1:3] == ["-m", "venv"]:
                 raise subprocess.CalledProcessError(
                     1, argv, stderr="simulated venv create failure"
                 )
