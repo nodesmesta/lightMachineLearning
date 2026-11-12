@@ -87,3 +87,24 @@ python3 tools/run_phase4_heldout.py \
 ```
 
 Phase 4 rejects empty partitions, overlapping groups, a test partition missing either class, a training partition without normal records, and thresholds outside `[0, 1]`. It scores the already-loaded model artifact without calling `fit()`; the training partition is retained for boundary and lineage validation, not for refitting. With `--tune-threshold-on-validation`, threshold selection also uses scores from the frozen artifact and never refits it. It returns exit code `0` only when held-out `test.accuracy >= 0.94`, `1` for a valid evaluation that fails the quality gate, and `2` for an invalid dataset boundary. It does not modify `model.pkl`.
+
+## Reproducible candidate training
+
+Create a candidate from the group-disjoint training partition without using
+validation or test labels for fitting:
+
+```sh
+python3 tools/train_socsoar_model.py \
+  --dataset /absolute/path/to/telemetry.csv \
+  --template-model bundles/socsoar-alert-scoring/models/model.pkl \
+  --output-model /absolute/path/to/candidate-model.pkl \
+  --output-report /absolute/path/to/candidate-training.json \
+  --seed 42
+```
+
+The trainer fits only label-0 records from the training partition and applies
+the same `normalize_for_model` transform used by the runtime adapter and the
+frozen evaluator. It records dataset/template/candidate hashes, split groups,
+training rows and the exact source revision. It never claims quality
+acceptance; the candidate must be evaluated with the frozen Phase 4 command
+against an untouched holdout and independently reviewed before promotion.
