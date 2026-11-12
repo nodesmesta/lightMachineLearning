@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import pickle
 import subprocess
 import sys
@@ -39,6 +40,20 @@ def _git_revision(path: Path) -> str:
     return result.stdout.strip() if result.returncode == 0 else "unknown"
 
 
+def normalize_for_model(vec: list[float]) -> list[float]:
+    """Match Project 3 bundle preprocessing before model evaluation."""
+    if len(vec) != 12:
+        raise ValueError(f"Expected exactly 12 features, got {len(vec)}")
+    normalized = list(vec)
+    normalized[2] = min(1.0, math.log1p(normalized[2]) / 10.0)
+    normalized[3] = min(1.0, normalized[3] / 50.0)
+    normalized[4] = min(1.0, normalized[4] / 8.0)
+    normalized[6] = min(1.0, normalized[6] / 10000.0)
+    normalized[9] = min(1.0, normalized[9] / 1024.0)
+    normalized[10] = min(1.0, normalized[10] / 100.0)
+    return [round(value, 4) for value in normalized]
+
+
 def _load_model(path: Path) -> Any:
     model_dir = str(path.parent.resolve())
     if model_dir not in sys.path:
@@ -67,16 +82,19 @@ def build_report(
             train,
             validation,
             thresholds=threshold_grid,
+            preprocess=normalize_for_model,
         )
         selected_threshold = tuning["threshold"]
         validation_report = tuning["report"]
     else:
         selected_threshold = threshold
         validation_report = evaluate_isolation_forest(
-            _load_model(model_path), train, validation, threshold=selected_threshold
+            _load_model(model_path), train, validation, threshold=selected_threshold,
+            preprocess=normalize_for_model,
         )
     test_report = evaluate_isolation_forest(
-        _load_model(model_path), train, test, threshold=selected_threshold
+        _load_model(model_path), train, test, threshold=selected_threshold,
+        preprocess=normalize_for_model,
     )
     return {
         "source_revision": _git_revision(Path(__file__).resolve().parents[1]),

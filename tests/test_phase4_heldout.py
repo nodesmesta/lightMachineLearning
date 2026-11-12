@@ -30,6 +30,7 @@ class Phase4HeldoutTests(unittest.TestCase):
         self.assertEqual(report["phase"], 4)
         self.assertEqual(report["status"], "PASS")
         self.assertEqual(report["selection_set"], "frozen")
+        self.assertFalse(report["model_fit"])
         self.assertEqual(report["test"]["accuracy"], 1.0)
         self.assertTrue(report["quality_gate"]["passed"])
 
@@ -58,6 +59,23 @@ class Phase4HeldoutTests(unittest.TestCase):
                 model=object(),
                 threshold=0.5,
             )
+
+    def test_frozen_heldout_does_not_refit_the_model_artifact(self):
+        class FrozenModel:
+            def fit(self, rows):
+                raise AssertionError("Phase 4 must not refit a frozen model artifact")
+
+            def predict_proba(self, rows):
+                return [[1.0 - row[0], row[0]] for row in rows]
+
+        report = evaluate_heldout(
+            *self.records(),
+            model=FrozenModel(),
+            threshold=0.5,
+        )
+
+        self.assertEqual(report["status"], "PASS")
+        self.assertEqual(report["test"]["accuracy"], 1.0)
 
 
 if __name__ == "__main__":

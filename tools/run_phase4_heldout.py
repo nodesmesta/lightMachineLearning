@@ -13,8 +13,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tools.evaluation_dataset import load_dataset, split_by_group
-from tools.evaluate_socsoar_model import _git_revision, _load_model, _sha256_file
-from tools.model_evaluation import tune_threshold
+from tools.evaluate_socsoar_model import _git_revision, _load_model, _sha256_file, normalize_for_model
+from tools.model_evaluation import tune_threshold_frozen_model
 from tools.phase4_heldout import HeldoutDatasetError, evaluate_heldout
 
 
@@ -48,8 +48,11 @@ def main() -> int:
             for value in args.threshold_grid.split(",")
             if value.strip()
         )
-        threshold_tuning = tune_threshold(
-            _load_model(args.model), train, validation, thresholds=grid
+        threshold_tuning = tune_threshold_frozen_model(
+            _load_model(args.model),
+            validation,
+            thresholds=grid,
+            preprocess=normalize_for_model,
         )
         threshold = threshold_tuning["threshold"]
         threshold_source = "validation"
@@ -62,6 +65,7 @@ def main() -> int:
             model=_load_model(args.model),
             threshold=threshold,
             minimum_accuracy=args.minimum_accuracy,
+            preprocess=normalize_for_model,
         )
     except HeldoutDatasetError as exc:
         report = {

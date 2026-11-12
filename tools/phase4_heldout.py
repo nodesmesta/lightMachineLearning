@@ -1,10 +1,10 @@
 """Strict final held-out evaluation gate for LightML quality claims."""
 from __future__ import annotations
 
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Sequence
 
 from tools.evaluation_dataset import DatasetRecord
-from tools.model_evaluation import evaluate_isolation_forest
+from tools.model_evaluation import evaluate_frozen_model
 
 
 class HeldoutDatasetError(ValueError):
@@ -49,6 +49,7 @@ def evaluate_heldout(
     model: Any,
     threshold: float,
     minimum_accuracy: float = 0.94,
+    preprocess: Callable[[Sequence[float]], Sequence[float]] | None = None,
 ) -> dict[str, Any]:
     """Evaluate a frozen threshold once on a validated held-out partition."""
     train = list(train_records)
@@ -58,12 +59,15 @@ def evaluate_heldout(
     if not 0.0 <= threshold <= 1.0:
         raise HeldoutDatasetError("frozen threshold must be between 0.0 and 1.0")
 
-    report = evaluate_isolation_forest(model, train, test, threshold=threshold)
+    report = evaluate_frozen_model(
+        model, test, threshold=threshold, preprocess=preprocess
+    )
     passed = report["accuracy"] >= minimum_accuracy
     return {
         "phase": 4,
         "status": "PASS" if passed else "FAIL",
         "selection_set": "frozen",
+        "model_fit": False,
         "threshold": threshold,
         "test": report,
         "quality_gate": {

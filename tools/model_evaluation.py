@@ -1,7 +1,7 @@
 """Baseline quality metrics for the current LightML anomaly scorer."""
 from __future__ import annotations
 
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from tools.evaluation_dataset import DatasetRecord
 
@@ -67,6 +67,7 @@ def evaluate_isolation_forest(
     evaluation_records: Iterable[DatasetRecord],
     *,
     threshold: float = 0.75,
+    preprocess: Callable[[Sequence[float]], Sequence[float]] | None = None,
 ) -> dict[str, Any]:
     """Fit the current unsupervised model on normal records and evaluate labels."""
     train_records = list(train_records)
@@ -77,8 +78,30 @@ def evaluate_isolation_forest(
     if not evaluation_records:
         raise ValueError("evaluation set must contain at least one record")
 
-    model.fit(normal_rows)
-    rows = [list(record.features) for record in evaluation_records]
+    transform = preprocess or (lambda row: row)
+    model.fit([list(transform(row)) for row in normal_rows])
+    return evaluate_frozen_model(
+        model,
+        evaluation_records,
+        threshold=threshold,
+        preprocess=preprocess,
+    )
+
+
+def evaluate_frozen_model(
+    model: Any,
+    evaluation_records: Iterable[DatasetRecord],
+    *,
+    threshold: float = 0.75,
+    preprocess: Callable[[Sequence[float]], Sequence[float]] | None = None,
+) -> dict[str, Any]:
+    """Score records with an already-fitted model without mutating it."""
+    evaluation_records = list(evaluation_records)
+    if not evaluation_records:
+        raise ValueError("evaluation set must contain at least one record")
+
+    transform = preprocess or (lambda row: row)
+    rows = [list(transform(record.features)) for record in evaluation_records]
     probabilities = model.predict_proba(rows)
     scores = [float(result[1]) for result in probabilities]
     predictions = [1 if score > threshold else 0 for score in scores]
@@ -96,6 +119,7 @@ def tune_threshold(
     validation_records: Iterable[DatasetRecord],
     *,
     thresholds: Iterable[float],
+    preprocess: Callable[[Sequence[float]], Sequence[float]] | None = None,
 ) -> dict[str, Any]:
     """Select a threshold using validation metrics only.
 
@@ -115,8 +139,9 @@ def tune_threshold(
     if not validation_records:
         raise ValueError("validation set must contain at least one record")
 
-    model.fit(normal_rows)
-    rows = [list(record.features) for record in validation_records]
+    transform = preprocess or (lambda row: row)
+    model.fit([list(transform(row)) for row in normal_rows])
+    rows = [list(transform(record.features)) for record in validation_records]
     scores = [float(result[1]) for result in model.predict_proba(rows)]
     labels = [record.label for record in validation_records]
     candidates = []
@@ -140,4 +165,49 @@ def tune_threshold(
         "report": best,
         "candidates": candidates,
         "selection_set": "validation",
+    }
+
+
+def tune_threshold_frozen_model(
+    model: Any,
+    validation_records: Iterable[DatasetRecord],
+    *,
+    thresholds: Iterable[float],
+    preprocess: Callable[[Sequence[float]], Sequence[float]] | None = None,
+) -> dict[str, Any]:
+    """Select a threshold from validation scores without fitting the model."""
+    validation_records = list(validation_records)
+    threshold_grid = sorted({float(value) for value in thresholds})
+    if not threshold_grid:
+        raise ValueError("threshold grid must contain at least one value")
+    if any(value < 0.0 or value > 1.0 for value in threshold_grid):
+        raise ValueError("thresholds must be between 0.0 and 1.0")
+    if not validation_records:
+        raise ValueError("validation set must contain at least one record")
+
+    candidates = [
+        evaluate_frozen_model(
+            model,
+            validation_records,
+            threshold=threshold,
+            preprocess=preprocess,
+        )
+        for threshold in threshold_grid
+    ]
+    best = max(
+        candidates,
+        key=lambda report: (
+            report["accuracy"],
+            report["balanced_accuracy"],
+            report["f1"],
+            report["recall"],
+            -report["threshold"],
+        ),
+    )
+    return {
+        "threshold": best["threshold"],
+        "report": best,
+        "candidates": candidates,
+        "selection_set": "validation",
+        "model_fit": False,
     }

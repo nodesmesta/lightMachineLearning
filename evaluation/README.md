@@ -57,7 +57,7 @@ python3 tools/evaluate_socsoar_model.py \
   --output /absolute/path/to/baseline-report.json
 ```
 
-The runner fits the current Isolation Forest only on normal training records, evaluates validation and held-out test groups at the declared threshold, and exits non-zero when `test.accuracy` is below the default `0.94` gate. The JSON report records model and dataset hashes, source revision, split groups, confusion matrix, accuracy, balanced accuracy, precision, recall, F1, false-positive rate, and false-negative rate.
+The baseline runner fits the current Isolation Forest only on normal training records, evaluates validation and held-out test groups at the declared threshold, and exits non-zero when `test.accuracy` is below the default `0.94` gate. This is a train-on-normal baseline, not a frozen-artifact qualification. The JSON report records model and dataset hashes, source revision, split groups, confusion matrix, accuracy, balanced accuracy, precision, recall, F1, false-positive rate, and false-negative rate.
 
 The smoke fixture used during development is not production evidence. A real labeled dataset is required before making an accuracy claim.
 
@@ -86,4 +86,4 @@ python3 tools/run_phase4_heldout.py \
   --output /absolute/path/to/phase4-heldout-report.json
 ```
 
-Phase 4 rejects empty partitions, overlapping groups, a test partition missing either class, a training partition without normal records, and thresholds outside `[0, 1]`. It returns exit code `0` only when held-out `test.accuracy >= 0.94`, `1` for a valid evaluation that fails the quality gate, and `2` for an invalid dataset boundary. It does not modify `model.pkl`.
+Phase 4 rejects empty partitions, overlapping groups, a test partition missing either class, a training partition without normal records, and thresholds outside `[0, 1]`. It scores the already-loaded model artifact without calling `fit()`; the training partition is retained for boundary and lineage validation, not for refitting. With `--tune-threshold-on-validation`, threshold selection also uses scores from the frozen artifact and never refits it. It returns exit code `0` only when held-out `test.accuracy >= 0.94`, `1` for a valid evaluation that fails the quality gate, and `2` for an invalid dataset boundary. It does not modify `model.pkl`.
