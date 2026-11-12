@@ -73,5 +73,29 @@ class SocsoarInputContractTests(unittest.TestCase):
                     self.assertIsNone(result["anomaly_score"])
                     self.assertEqual(self.model.calls, 0)
 
+    def test_runtime_contract_is_normalized_before_model_prediction(self):
+        captured = []
+
+        class CapturingModel(RecordingModel):
+            def predict_proba(self, vectors):
+                self.calls += 1
+                captured.extend(vectors)
+                return [[.25, .75]]
+
+        model = CapturingModel()
+        adapter = module.Adapter()
+        adapter.initialize({"models": {"primary": model}, "config": MANIFEST})
+        telemetry = dict(VALID, cmd_len=100.0, arg_count=50.0,
+                         token_entropy=8.0, start_tick_delta=10000.0,
+                         cpu_tick_ratio=1.0, fd_count=1024.0,
+                         thread_count=100.0)
+
+        result = adapter.infer(self.payload(telemetry, "telemetry"), {})
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(captured, [[.1, .01, round(math.log1p(100.0) / 10.0, 4),
+                                     1.0, 1.0, 1.0, 1.0, .01, 1.0,
+                                     1.0, 1.0, 0.0]])
+
 if __name__ == "__main__":
     unittest.main()

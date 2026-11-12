@@ -17,6 +17,20 @@ FEATURE_KEYS = [
 ]
 
 
+def normalize_for_model(vec: List[float]) -> List[float]:
+    """Map the public raw telemetry contract to the model's unit interval."""
+    if len(vec) != len(FEATURE_KEYS):
+        raise ValueError(f"Expected exactly 12 features, got {len(vec)}")
+    normalized = list(vec)
+    normalized[2] = min(1.0, math.log1p(normalized[2]) / 10.0)
+    normalized[3] = min(1.0, normalized[3] / 50.0)
+    normalized[4] = min(1.0, normalized[4] / 8.0)
+    normalized[6] = min(1.0, normalized[6] / 10000.0)
+    normalized[9] = min(1.0, normalized[9] / 1024.0)
+    normalized[10] = min(1.0, normalized[10] / 100.0)
+    return [round(value, 4) for value in normalized]
+
+
 class Adapter(Adapter):
     def initialize(self, context: Dict[str, Any]) -> None:
         self.model = context.get('models', {}).get('primary')
@@ -93,13 +107,18 @@ class Adapter(Adapter):
                 'timestamp': now_iso,
             }
 
+        # The signed model was trained on normalized feature units. Keep the
+        # external contract in raw telemetry units, then transform at the
+        # bundle boundary before prediction.
+        model_vec = normalize_for_model(vec)
+
         # Predict
         if hasattr(self.model, 'predict_proba'):
-            preds = self.model.predict_proba([vec])
+            preds = self.model.predict_proba([model_vec])
             row = preds[0]
             score = float(row[1]) if len(row) > 1 else float(row[0])
         elif hasattr(self.model, 'predict'):
-            preds = self.model.predict([vec])
+            preds = self.model.predict([model_vec])
             score = float(preds[0])
         else:
             raise RuntimeError('Model not callable or missing predict')
