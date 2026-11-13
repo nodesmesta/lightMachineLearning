@@ -13,8 +13,8 @@ import sys
 import time
 import unittest
 
-BUNDLE_DIR = "/home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV/lib/project2-endpoint-scoring"
-LIGHTML_ROOT = "/home/sydeco/Dev/SYDECO_LIGHTML_V2_DEV"
+LIGHTML_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BUNDLE_DIR = os.path.join(LIGHTML_ROOT, "lib", "project2-endpoint-scoring")
 
 if BUNDLE_DIR not in sys.path:
     sys.path.insert(0, BUNDLE_DIR)
