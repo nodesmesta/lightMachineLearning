@@ -55,9 +55,14 @@ def normalize_for_model(vec: list[float]) -> list[float]:
 
 
 def _load_model(path: Path) -> Any:
-    model_dir = str(path.parent.resolve())
-    if model_dir not in sys.path:
-        sys.path.insert(0, model_dir)
+    model_dirs = [
+        path.parent.resolve(),
+        REPO_ROOT / "bundles" / "socsoar-alert-scoring" / "models",
+    ]
+    for model_dir_path in model_dirs:
+        model_dir = str(model_dir_path)
+        if model_dir not in sys.path:
+            sys.path.insert(0, model_dir)
     with path.open("rb") as handle:
         return pickle.load(handle)
 
