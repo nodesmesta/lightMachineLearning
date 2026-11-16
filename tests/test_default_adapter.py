@@ -20,6 +20,14 @@ class MockModelPredictProba:
         return [[1.0 - x, x] for x in X]
 
 
+class MockModelFailingPredictProba:
+    def predict_proba(self, X: Any) -> Any:
+        raise ValueError("Simulated predict_proba failure")
+
+    def predict(self, X: Any) -> Any:
+        return [0 for _ in X]
+
+
 class TestDefaultModelAdapter(unittest.TestCase):
     def test_required_fields_omits_adapter(self) -> None:
         self.assertNotIn("adapter", REQUIRED_MANIFEST_FIELDS)
@@ -86,6 +94,19 @@ class TestDefaultModelAdapter(unittest.TestCase):
 
         adapter.shutdown()
 
+    def test_default_adapter_predict_proba_failure_raises(self) -> None:
+        """Verify that when predict_proba fails, it does NOT silently swallow the error or fall back to predict()."""
+        adapter = DefaultModelAdapter()
+        context = {"models": {"primary": MockModelFailingPredictProba()}}
+        adapter.initialize(context)
+
+        with self.assertRaises(ValueError) as ctx:
+            adapter.infer({"inputs": [0.5]}, context)
+
+        self.assertIn("Simulated predict_proba failure", str(ctx.exception))
+        adapter.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()
+

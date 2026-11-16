@@ -111,10 +111,7 @@ class DefaultModelAdapter(Adapter):
         # Execute model prediction
         model = self.primary_model
         if hasattr(model, "predict_proba"):
-            try:
-                preds = model.predict_proba(inputs)
-            except Exception:
-                preds = model.predict(inputs) if hasattr(model, "predict") else model(inputs)
+            preds = model.predict_proba(inputs)
         elif hasattr(model, "predict"):
             preds = model.predict(inputs)
         elif callable(model):

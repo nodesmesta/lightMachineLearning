@@ -135,6 +135,20 @@ def load_artifacts(manifest: Dict[str, Any], app_root: str) -> Dict[str, Any]:
     if len(order) != len(by_role):
         raise LoadError("model dependency cycle detected (E3)")
 
+    import sys
+    app_root_abs = os.path.abspath(app_root)
+    # Pickled model classes are resolved from the canonical models directory.
+    # Do not add the adapter directory: a duplicate endpoint_model.py there
+    # would make module resolution depend on sys.path insertion order.
+    canonical_paths = [
+        app_root_abs,
+        os.path.abspath(os.path.join(app_root_abs, "models")),
+    ]
+    sys.path[:] = [path for path in sys.path if os.path.abspath(path) not in canonical_paths]
+    for path in reversed(canonical_paths):
+        if os.path.isdir(path):
+            sys.path.insert(0, path)
+
     loaded: Dict[str, Any] = {}
     for role in order:
         m = by_role[role]

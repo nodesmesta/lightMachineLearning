@@ -1,0 +1,186 @@
+{
+  "manifest_version": 1,
+  "app_id": "socsoar-alert-scoring",
+  "name": "SYDECO Sovereign SOAR Alert & Anomaly Scoring Engine",
+  "version": "1.0.0",
+  "capabilities": [
+    "inference"
+  ],
+  "models": [
+    {
+      "role": "primary",
+      "file": "models/model.pkl",
+      "format": "pickle",
+      "sha256": "90b30ca6d9b84d7fdc421aecbe1af76cf43fba3ae0a159df17fdb66a948269ab"
+    }
+  ],
+  "adapter": {
+    "entry": "adapter/main.py",
+    "files": [
+      {
+        "file": "adapter/main.py",
+        "sha256": "455a2baa5e1515bb5faac521c6508cdb8cf1fd11c5945e1708ae2237187b97cc"
+      }
+    ]
+  },
+  "release": {
+    "key_id": "sydeco-test-key-v1",
+    "signature": "manifest.sig"
+  },
+  "input_schema": {
+    "": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "event_id": {
+        "type": "string"
+      },
+      "timestamp": {
+        "type": "string"
+      },
+      "source_category": {
+        "type": "string"
+      },
+      "telemetry": {
+        "type": "object",
+        "required": [
+          "pid_ratio",
+          "ppid_ratio",
+          "cmd_len",
+          "arg_count",
+          "token_entropy",
+          "uid_class",
+          "start_tick_delta",
+          "mem_rss_ratio",
+          "cpu_tick_ratio",
+          "fd_count",
+          "thread_count",
+          "privilege_flag"
+        ],
+        "properties": {
+          "pid_ratio": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "ppid_ratio": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "cmd_len": {
+            "type": "number",
+            "minimum": 0.0
+          },
+          "arg_count": {
+            "type": "number",
+            "minimum": 0.0
+          },
+          "token_entropy": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 8.0
+          },
+          "uid_class": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 3.0
+          },
+          "start_tick_delta": {
+            "type": "number",
+            "minimum": 0.0
+          },
+          "mem_rss_ratio": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "cpu_tick_ratio": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "fd_count": {
+            "type": "number",
+            "minimum": 0.0
+          },
+          "thread_count": {
+            "type": "number",
+            "minimum": 1.0
+          },
+          "privilege_flag": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0
+          }
+        }
+      },
+      "features": {
+        "type": "array",
+        "minItems": 12,
+        "maxItems": 12,
+        "items": {
+          "type": "number"
+        }
+      }
+    }
+  },
+  "output_schema": {
+    "": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "required": [
+      "status",
+      "model_version",
+      "receipt_hash"
+    ],
+    "properties": {
+      "status": {
+        "type": "string"
+      },
+      "app_id": {
+        "type": "string"
+      },
+      "inference_id": {
+        "type": "string"
+      },
+      "model_version": {
+        "type": "string"
+      },
+      "anomaly_score": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "confidence": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "receipt_hash": {
+        "type": "string"
+      },
+      "timestamp": {
+        "type": "string"
+      },
+      "http_status": {
+        "type": "integer"
+      },
+      "error": {
+        "type": "string"
+      }
+    }
+  },
+  "permissions": {
+    "network": "none"
+  },
+  "api": {
+    "authentication": "token"
+  },
+  "resource_limits": {
+    "max_memory": 268435456,
+    "max_cpu": 50,
+    "inference_timeout": 15,
+    "concurrency": 1
+  }
+}

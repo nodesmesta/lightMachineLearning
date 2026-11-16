@@ -34,45 +34,14 @@ class Project2LightMLClient:
         self.token = token or os.environ.get("LIGHTML_BEARER_TOKEN", "")
         self.timeout_sec = max(0.001, timeout_ms / 1000.0)
 
-    def score_process_telemetry(
-        self,
-        trace_id: str,
-        features: List[float],
-        process_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """Query local LightML runtime for advisory endpoint anomaly scoring.
-
-        Returns structured dictionary. NEVER raises exceptions to the caller;
-        traps all socket, HTTP, JSON, and timeout errors, returning a
-        standardized fail-safe fallback envelope ('status': 'unavailable').
-        """
+    def invoke(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Send generic JSON payload to the endpoint scoring application."""
         start_time = time.perf_counter()
-
-        # Feature vector validation
-        if not isinstance(features, (list, tuple)) or len(features) != 12:
-            return {
-                "inference_id": str(uuid.uuid4()),
-                "model_version": "unknown",
-                "anomaly_score": 0.0,
-                "confidence": 0.0,
-                "status": "unavailable",
-                "latency_ms": round((time.perf_counter() - start_time) * 1000.0, 3),
-                "receipt_hash": "",
-                "error": f"Invalid feature dimensions: expected 12, got {len(features) if isinstance(features, list) else type(features)}",
-            }
-
-        payload_dict = {
-            "trace_id": trace_id,
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "process_context": process_context or {},
-            "features": [float(x) for x in features],
-        }
-
-        body_bytes = json.dumps(payload_dict, sort_keys=True).encode("utf-8")
+        body_bytes = json.dumps(payload, sort_keys=True).encode("utf-8")
         headers = {
             "Content-Type": "application/json",
             "Content-Length": str(len(body_bytes)),
-            "User-Agent": "SYDECO-Project2-LightML-Connector/1.0",
+            "User-Agent": "SYDECO-Project2-LightML-Connector/1.1",
         }
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
@@ -90,70 +59,47 @@ class Project2LightMLClient:
             )
             response = conn.getresponse()
             raw_reply = response.read()
-
             elapsed_ms = round((time.perf_counter() - start_time) * 1000.0, 3)
 
             if response.status == 200:
-                reply_data = json.loads(raw_reply.decode("utf-8"))
-                # Handle standard Core envelope wrap or direct result
-                if "result" in reply_data and isinstance(reply_data["result"], list):
-                    # DefaultModelAdapter returns {"result": [[prob_norm, prob_anom]], ...}
-                    res_row = reply_data["result"][0]
-                    score = float(res_row[1]) if isinstance(res_row, list) and len(res_row) > 1 else float(res_row)
-                    receipt_hash = hashlib.sha256(f"{trace_id}:{score}:1.0.0".encode("utf-8")).hexdigest()
+                try:
+                    reply_data = json.loads(raw_reply.decode("utf-8"))
+                    if isinstance(reply_data, dict):
+                        reply_data["connector_latency_ms"] = elapsed_ms
+                        return reply_data
                     return {
-                        "inference_id": reply_data.get("inference_id", str(uuid.uuid4())),
-                        "model_version": reply_data.get("model_version", "1.0.0"),
-                        "anomaly_score": round(score, 4),
-                        "confidence": round(1.0 - abs(0.5 - score) * 0.2, 4),
                         "status": "ok",
-                        "latency_ms": elapsed_ms,
-                        "receipt_hash": receipt_hash,
+                        "data": reply_data,
+                        "connector_latency_ms": elapsed_ms,
                     }
-                elif "anomaly_score" in reply_data:
+                except Exception as json_err:
                     return {
-                        "inference_id": reply_data.get("inference_id", str(uuid.uuid4())),
-                        "model_version": reply_data.get("model_version", "1.0.0"),
-                        "anomaly_score": float(reply_data["anomaly_score"]),
-                        "confidence": float(reply_data.get("confidence", 0.95)),
-                        "status": reply_data.get("status", "ok"),
-                        "latency_ms": elapsed_ms,
-                        "receipt_hash": reply_data.get("receipt_hash", ""),
-                    }
-                else:
-                    return {
-                        "inference_id": str(uuid.uuid4()),
-                        "model_version": "1.0.0",
-                        "anomaly_score": 0.0,
-                        "confidence": 0.0,
-                        "status": "degraded",
-                        "latency_ms": elapsed_ms,
-                        "receipt_hash": "",
-                        "error": f"Unexpected response schema: {reply_data}",
+                        "status": "unavailable",
+                        "error_type": "InvalidJSONResponse",
+                        "error_detail": f"Failed to parse server response as JSON: {json_err}",
+                        "anomaly_score": None,
+                        "confidence": None,
+                        "connector_latency_ms": elapsed_ms,
                     }
             else:
                 return {
-                    "inference_id": str(uuid.uuid4()),
-                    "model_version": "unknown",
-                    "anomaly_score": 0.0,
-                    "confidence": 0.0,
                     "status": "unavailable",
-                    "latency_ms": elapsed_ms,
-                    "receipt_hash": "",
-                    "error": f"HTTP {response.status}: {raw_reply.decode('utf-8', errors='replace')}",
+                    "http_code": response.status,
+                    "error_type": f"HTTP_{response.status}",
+                    "error_detail": raw_reply.decode("utf-8", errors="replace"),
+                    "anomaly_score": None,
+                    "confidence": None,
+                    "connector_latency_ms": elapsed_ms,
                 }
-
-        except Exception as exc:
+        except (http.client.HTTPException, OSError, TimeoutError, Exception) as exc:
             elapsed_ms = round((time.perf_counter() - start_time) * 1000.0, 3)
             return {
-                "inference_id": str(uuid.uuid4()),
-                "model_version": "unknown",
-                "anomaly_score": 0.0,
-                "confidence": 0.0,
                 "status": "unavailable",
-                "latency_ms": elapsed_ms,
-                "receipt_hash": "",
-                "error": f"{type(exc).__name__}: {exc}",
+                "error_type": exc.__class__.__name__,
+                "error_detail": str(exc),
+                "anomaly_score": None,
+                "confidence": None,
+                "connector_latency_ms": elapsed_ms,
             }
         finally:
             if conn:
@@ -161,6 +107,89 @@ class Project2LightMLClient:
                     conn.close()
                 except Exception:
                     pass
+
+    def score_process_telemetry(
+        self,
+        trace_id: str,
+        features: List[float],
+        process_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Query local LightML runtime for advisory endpoint anomaly scoring.
+
+        Returns structured dictionary. NEVER raises exceptions to the caller;
+        traps all socket, HTTP, JSON, and timeout errors, returning a
+        standardized fail-safe fallback envelope ('status': 'unavailable')
+        with 'anomaly_score': None (never fake 0.0 scores).
+        """
+        start_time = time.perf_counter()
+
+        # Feature vector validation
+        if not isinstance(features, (list, tuple)) or len(features) != 12:
+            elapsed_ms = round((time.perf_counter() - start_time) * 1000.0, 3)
+            err_detail = f"Invalid feature dimensions: expected 12, got {len(features) if isinstance(features, list) else type(features)}"
+            return {
+                "inference_id": str(uuid.uuid4()),
+                "model_version": "unknown",
+                "anomaly_score": None,
+                "confidence": None,
+                "status": "unavailable",
+                "latency_ms": elapsed_ms,
+                "receipt_hash": "",
+                "error_type": "ValidationError",
+                "error_detail": err_detail,
+                "error": f"ValidationError: {err_detail}",
+            }
+
+        payload_dict = {
+            "trace_id": trace_id,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "process_context": process_context or {},
+            "features": [float(x) for x in features],
+        }
+
+        inv_res = self.invoke(payload_dict)
+        elapsed_ms = inv_res.get("connector_latency_ms", round((time.perf_counter() - start_time) * 1000.0, 3))
+
+        if inv_res.get("status") == "ok":
+            if "result" in inv_res and isinstance(inv_res["result"], list):
+                res_row = inv_res["result"][0]
+                score = float(res_row[1]) if isinstance(res_row, list) and len(res_row) > 1 else float(res_row)
+                receipt_hash = hashlib.sha256(f"{trace_id}:{score}:1.0.0".encode("utf-8")).hexdigest()
+                return {
+                    "inference_id": inv_res.get("inference_id", str(uuid.uuid4())),
+                    "model_version": inv_res.get("model_version", "1.0.0"),
+                    "anomaly_score": round(score, 4),
+                    "confidence": round(1.0 - abs(0.5 - score) * 0.2, 4),
+                    "status": "ok",
+                    "latency_ms": elapsed_ms,
+                    "receipt_hash": receipt_hash,
+                }
+            elif "anomaly_score" in inv_res and inv_res["anomaly_score"] is not None:
+                return {
+                    "inference_id": inv_res.get("inference_id", str(uuid.uuid4())),
+                    "model_version": inv_res.get("model_version", "1.0.0"),
+                    "anomaly_score": float(inv_res["anomaly_score"]),
+                    "confidence": float(inv_res.get("confidence", 0.95)),
+                    "status": "ok",
+                    "latency_ms": elapsed_ms,
+                    "receipt_hash": inv_res.get("receipt_hash", ""),
+                }
+
+        # Failure / unavailable path: Explicit None score, never 0.0
+        err_type = inv_res.get("error_type", "ServiceUnavailable")
+        err_detail = inv_res.get("error_detail", "LightML daemon unavailable")
+        return {
+            "inference_id": str(uuid.uuid4()),
+            "model_version": "unknown",
+            "anomaly_score": None,
+            "confidence": None,
+            "status": "unavailable",
+            "latency_ms": elapsed_ms,
+            "receipt_hash": "",
+            "error_type": err_type,
+            "error_detail": err_detail,
+            "error": f"{err_type}: {err_detail}",
+        }
 
 
 # ==============================================================================
@@ -225,20 +254,6 @@ def extract_telemetry_features(
     ]
 
 
-def evaluate_advisory_policy(
-    anomaly_score: float, default_mode: str = "allow"
-) -> Tuple[str, str]:
-    """Apply advisory decision logic to augment Project 2 policy evaluation.
-
-    Returns (target_mode, risk_level).
-    - If anomaly_score > 0.75: escalates to ('require_review', 'high').
-    - If anomaly_score <= 0.75: retains (default_mode, 'low').
-    """
-    if anomaly_score > 0.75:
-        return "require_review", "high"
-    return default_mode, "low"
-
-
 if __name__ == "__main__":
     print("Testing Project2LightMLClient offline fallback...")
     client = Project2LightMLClient(host="127.0.0.1", port=59999, timeout_ms=5)
@@ -251,5 +266,6 @@ if __name__ == "__main__":
     print("Fallback response when service stopped:")
     print(json.dumps(result, indent=2))
     assert result["status"] == "unavailable"
-    assert result["anomaly_score"] == 0.0
-    print("Safe fallback verification: PASS")
+    assert result["anomaly_score"] is None
+    print("Safe fallback verification: PASS (Zero synthetic scores, failure is explicit)")
+
